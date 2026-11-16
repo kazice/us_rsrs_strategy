@@ -16,7 +16,9 @@
 1. 行情：只更新策略用得到的 503 只（11 板块成分股 + 11 只板块 ETF + SPY），
    不走全市场 1000 只，省掉一半时间；
 2. 换手率：腾讯报价的换手率字段就是「成交量 ÷ 当日总股本」，与 ws 面板同源同口径，
-   按 (symbol, date) 幂等覆盖写回 parquet。
+   按 (symbol, date) 幂等覆盖写回 parquet；
+3. 全市场快照：Nasdaq 市值前 1000，给「股本取不到时用 market_cap / price 反推」兜底。
+   build() 内部按 refresh_hours（默认 24h）判新旧，重复调用直接读缓存。
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant.data import fetch, store
+from quant.data import fetch, store, universe
 from quant.live import calendar, pool, quotes
 from quant.live.signal import BENCH, SECTOR_ETFS
 
@@ -143,6 +145,15 @@ def main() -> int:
               f"失败 {len(stats['failed'])} 只")
         if stats["failed"]:
             print(f"  失败：{' '.join(stats['failed'][:20])}")
+
+    # --- 3. 全市场快照：市值 / 价格兜底（股本取不到时用 market_cap / price 反推） ---
+    # 失败不中断：快照只是兜底，旧的那份继续用，mcap 门槛会自动退化到只靠换手率反推
+    try:
+        snap = universe.build()
+        asof = str(snap["asof"].iloc[0]) if "asof" in snap.columns and len(snap) else "?"
+        print(f"全市场快照：{len(snap)} 行，as of {asof}")
+    except Exception as exc:                        # noqa: BLE001
+        print(f"::warning::全市场快照刷新失败：{type(exc).__name__}（沿用旧快照）")
 
     quote_map, notes = quotes.fetch_quotes(syms)
     if len(quote_map) < len(syms) * 0.5:
