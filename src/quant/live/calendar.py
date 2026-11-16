@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
+from quant.config import get_settings
+
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
@@ -161,7 +163,10 @@ def _fetch_json(url: str) -> dict | None:
         with urllib.request.urlopen(req, timeout=_ONLINE_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception as exc:                        # 网络/接口结构变化都不许中断主流程
-        log.info("日历接口不可用 %s：%s", url, type(exc).__name__)
+        # 带出状态码：403 是封 UA/IP，404 是端点搬家，处理方式完全不同
+        code = getattr(exc, "code", None)
+        log.info("日历接口不可用 %s：%s%s", url, type(exc).__name__,
+                 f" HTTP {code}" if code else "")
         return None
 
 
@@ -198,6 +203,47 @@ def _parse_nasdaq_hours(payload: dict | None) -> dict[str, dict]:
     return out
 
 
+def _alpaca_close_et(d: dt.date) -> tuple[dt.time | None, str] | None:
+    """Alpaca 交易日历取当日收盘。没配密钥返回 None（= 这个源不可用）。
+
+    为什么加这个源：Nasdaq 的 calendar 接口从 2026-11 起对非常规请求整体 403，
+    本地和 Actions 都拿不到，早收日就只能靠内置规则（只覆盖感恩节次日/7-3/平安夜）。
+    Alpaca 的 /v2/calendar 直接给每天的 close，早收日就是 13:00，正好是我们需要的。
+    """
+    try:
+        cfg = get_settings().sources.alpaca
+        key, secret = (cfg.key_id or "").strip(), (cfg.secret or "").strip()
+    except Exception:                               # noqa: BLE001  配置缺失不该影响主流程
+        return None
+    if not key or not secret:
+        return None
+
+    # 免费账户的密钥一般配在 paper 环境，两个域名都试一次
+    for host in ("https://api.alpaca.markets", "https://paper-api.alpaca.markets"):
+        url = f"{host}/v2/calendar?start={d.isoformat()}&end={d.isoformat()}"
+        try:
+            req = urllib.request.Request(url, headers={
+                "APCA-API-KEY-ID": key,
+                "APCA-API-SECRET-KEY": secret,
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=_ONLINE_TIMEOUT) as resp:
+                rows = json.loads(resp.read().decode("utf-8", "ignore"))
+        except Exception as exc:                    # noqa: BLE001
+            log.info("Alpaca 日历不可用 %s：%s", host,
+                     getattr(exc, "code", type(exc).__name__))
+            continue
+        if not isinstance(rows, list):
+            continue
+        if not rows:
+            return None, "alpaca 判定当日休市"
+        close = str((rows[0] or {}).get("close") or "")
+        if len(close) >= 5 and close[:2].isdigit():
+            return dt.time(int(close[:2]), int(close[3:5])), f"alpaca 收盘 {close} ET"
+        return None
+    return None
+
+
 def online_close_et(d: dt.date) -> tuple[dt.time | None, str]:
     """联网取当日收盘时间。返回 (收盘时间 or None, 来源说明)。
 
@@ -206,6 +252,7 @@ def online_close_et(d: dt.date) -> tuple[dt.time | None, str]:
     """
     urls = [
         f"https://api.nasdaq.com/api/calendar/holidays?dates={d:%Y-%m}",
+        f"https://api.nasdaq.com/api/calendar/holidays?year={d.year}",
     ]
     for url in urls:
         table = _parse_nasdaq_hours(_fetch_json(url))
@@ -218,6 +265,11 @@ def online_close_et(d: dt.date) -> tuple[dt.time | None, str]:
         if len(close) >= 5 and close[:2].isdigit():
             hh, mm = int(close[:2]), int(close[3:5])
             return dt.time(hh, mm), f"nasdaq:{close} ET"
+
+    # Nasdaq 拿不到时退到 Alpaca（需密钥），再不行由内置规则兜底
+    hit = _alpaca_close_et(d)
+    if hit is not None:
+        return hit
     return None, "联网日历不可用"
 
 
@@ -308,7 +360,8 @@ def occasion_for(d: dt.date) -> Occasion:
     if nxt.isocalendar()[:2] != d.isocalendar()[:2]:
         return Occasion("week", d, close, trigger, f"{d} 是本周最后一个交易日")
 
-    return Occasion("none", d, None, trigger, f"{d} 既非月末也非周末最后交易日")
+    # close 要透传：原来这里塞 None，日志就打成「收盘 None；触发 20:30」自相矛盾
+    return Occasion("none", d, close, trigger, f"{d} 既非月末也非周末最后交易日")
 
 
 def in_execution_window(now: dt.datetime, occasion: Occasion,
