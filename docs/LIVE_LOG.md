@@ -87,7 +87,7 @@ state/live/
 | `price` | 当时的未复权价（盘中实时价） |
 | `turnover20` | 20 日均换手率（小数，0.0086 = 0.86%） |
 | `mcap` | 市值（**美元**，不是亿美元） |
-| `mcap_src` | 市值来源：`snapshot`（Nasdaq 日快照）/ `ws`（20 日换手率反推）/ `sec`（SEC 申报股本） |
+| `mcap_src` | 市值来源：`snapshot`（Nasdaq 日快照）/ `ws`（5 日换手率反推）/ `sec`（SEC 申报股本） |
 | `mcap_ok` | 是否通过市值门槛 |
 | `turn_ok` | 是否在换手率上限内（≤20%） |
 | `ma10` / `ma20` / `ma50` | 均线（复权价口径） |
