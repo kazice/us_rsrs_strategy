@@ -164,19 +164,6 @@ def scan_universe(root: Path) -> dict:
     return {"ok": True, "rows": row[0], "asof": row[1], "size_mb": _mb(p)}
 
 
-def scan_state(root: Path) -> dict:
-    p = root / "meta" / "state.json"
-    if not p.exists():
-        return {"ok": False, "why": "meta/state.json 不存在"}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as exc:                       # noqa: BLE001
-        return {"ok": False, "why": f"解析失败 {type(exc).__name__}"}
-    n = len(data) if isinstance(data, (dict, list)) else 0
-    mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
-    return {"ok": True, "entries": n, "mtime": mtime, "size_mb": _mb(p)}
-
-
 def scan_ref(root: Path) -> dict:
     p = root / "ref" / "us_sector_holdings.csv"
     if not p.exists():
@@ -189,7 +176,7 @@ def scan_ref(root: Path) -> dict:
 
 # ------------------------------------------------------------------ 渲染
 def render(bars: dict, turn: dict, shares: dict, uni: dict,
-           state: dict, ref: dict) -> str:
+           ref: dict) -> str:
     now = datetime.now(timezone.utc)
     L: list[str] = []
     add = L.append
@@ -305,17 +292,6 @@ def render(bars: dict, turn: dict, shares: dict, uni: dict,
         add(f"- ❌ {uni.get('why')}")
     add("")
 
-    add("### 增量状态 `meta/state.json`")
-    add("")
-    add("每只股票上次抓到哪一天，增量更新靠它断点续抓。")
-    add("")
-    if state.get("ok"):
-        add(f"- 条目数：{_n(state['entries'])}")
-        add(f"- 最后写入：{state['mtime'].strftime('%Y-%m-%d %H:%M UTC')}")
-    else:
-        add(f"- ❌ {state.get('why')}")
-    add("")
-
     add("### 成分股快照 `ref/us_sector_holdings.csv`")
     add("")
     if ref.get("ok"):
@@ -357,10 +333,9 @@ def main() -> int:
     turn = scan_turnover(root)
     shares = scan_shares(root)
     uni = scan_universe(root)
-    state = scan_state(root)
     ref = scan_ref(root)
 
-    text = render(bars, turn, shares, uni, state, ref)
+    text = render(bars, turn, shares, uni, ref)
     if args.check:
         print(text)
     else:
