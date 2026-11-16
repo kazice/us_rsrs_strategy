@@ -76,7 +76,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/live_signal.log"
       - name: 上传运行日志（兜底，14 天）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: live-signal-${{ github.run_id }}
           path: ${{ runner.temp }}/live_signal.log
