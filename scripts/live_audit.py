@@ -49,7 +49,8 @@ def _snapshot_dirs(day: str | None = None) -> list[Path]:
     root = state_dir() / journal.DECISIONS_DIR
     if not root.exists():
         return []
-    dirs = sorted(p for p in root.glob("*/*") if p.is_dir() and not p.name.endswith(".tmp"))
+    # 快照是 decisions/<asof>_<run_id>/ 扁平一层；旧版按月分层的数据已迁移
+    dirs = sorted(p for p in root.glob("*") if p.is_dir() and not p.name.endswith(".tmp"))
     if day:
         dirs = [p for p in dirs if p.name.startswith(day)]
     return dirs
