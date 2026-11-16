@@ -5,10 +5,14 @@
 Actions 的 stdout 默认只留 90 天（可调最长 400 天），只能按 job 翻页、不可查询，
 过期即无从查证；runner 是一次性的，唯一能长期留住的只有 git。所以这里做两件事：
 
-1. **运行流水** ``runs/YYYY-MM.jsonl``：每次运行一行，**包括中止、空跑、失败**。
+1. **运行流水** ``runs.jsonl``：每次运行一行，**包括中止、空跑、失败**。
    没有这一行，「那天为什么没收到信号」只能去翻 90 天就消失的 run log。
-2. **决策快照** ``decisions/YYYY-MM/<asof>_<run_id>/``：完整输入与输出，可重放。
+2. **决策快照** ``decisions/<asof>_<run_id>/``：完整输入与输出，可重放。
    推送里只有结论，事后追问「为什么不是 X」只能靠这张表。
+
+为什么不再按月分目录：这个策略一个月只跑 4 次周报 + 1 次调仓，按月切只会切出
+一堆只有一两个文件的月份目录，翻起来反而更费劲。流水攒成单文件（一年 ~64 行），
+快照按日期扁平排列，靠 ``asof`` 前缀就够了。
 
 写入纪律（都是踩过的坑）
 ------------------------
@@ -36,8 +40,9 @@ from quant.live.books import state_dir
 
 log = logging.getLogger(__name__)
 
-RUNS_DIR = "runs"
-DECISIONS_DIR = "decisions"
+RUNS_FILE = "runs.jsonl"          # 全部运行流水一个文件：一年最多 ~64 行
+RUNS_DIR = "runs"                 # 旧版按月分文件的位置，仅保留兼容读取
+DECISIONS_DIR = "decisions"       # decisions/<asof>_<run_id>/，不再分月份层
 
 QUOTE_COLUMNS = ["symbol", "price", "prev_close", "high", "low", "volume",
                  "turnover_pct", "total_shares", "ts", "src"]
@@ -97,7 +102,7 @@ class Journal:
         if not self.enabled:
             return None
         try:
-            root = state_dir() / DECISIONS_DIR / self.asof.strftime("%Y-%m")
+            root = state_dir() / DECISIONS_DIR
             root.mkdir(parents=True, exist_ok=True)
             name = f"{self.asof.strftime('%Y-%m-%d')}_{self.run_id}"
             target = root / name
@@ -253,14 +258,14 @@ class Journal:
             "code": code,
         }
         row.update(self.extra)
-        path = state_dir() / RUNS_DIR / f"{now.strftime('%Y-%m')}.jsonl"
+        path = state_dir() / RUNS_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def read_runs(path: Path) -> list[dict]:
-    """读一个月度 runs 文件（坏行跳过，不让一条脏数据毁掉整份审计）。"""
+    """读一个 runs 文件（坏行跳过，不让一条脏数据毁掉整份审计）。"""
     rows = []
     if not path.exists():
         return rows
@@ -276,12 +281,15 @@ def read_runs(path: Path) -> list[dict]:
 
 
 def all_runs() -> list[dict]:
-    root = state_dir() / RUNS_DIR
-    if not root.exists():
-        return []
+    """全部运行流水。主位置是单文件 ``runs.jsonl``，旧的 ``runs/YYYY-MM.jsonl`` 一并读。"""
     rows: list[dict] = []
-    for p in sorted(root.glob("*.jsonl")):
-        rows += read_runs(p)
+    single = state_dir() / RUNS_FILE
+    if single.exists():
+        rows += read_runs(single)
+    legacy = state_dir() / RUNS_DIR
+    if legacy.exists():
+        for p in sorted(legacy.glob("*.jsonl")):
+            rows += read_runs(p)
     return sorted(rows, key=lambda r: r.get("ts_utc", ""))
 
 
