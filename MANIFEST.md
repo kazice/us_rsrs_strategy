@@ -3,14 +3,14 @@
 > 本文件由 `scripts/data_manifest.py` 自动生成，每次更新数据后**原地重写**，
 > 跟着数据一起提交，所以永远和实际内容一致。**不要手工编辑**，改了下次也会被覆盖。
 >
-> 生成时间：2026-11-16 06:51 UTC
+> 生成时间：2026-11-16 06:57 UTC
 
 ## 概况
 
 | 数据集 | 路径 | 规模 | 起始 | 结束 | 体积 |
 |---|---|---|---|---|---|
 | 日线 | `curated/bars_daily/` | 515 只 / 2,537,386 行 | 2005-01-03 | **2026-11-13** | 82.2 MB |
-| 20 日换手率面板 | `curated/fundamentals/turnover_daily.parquet` | 564 只 / 427,733 行 | 2023-04-03 | **2026-11-13** | 1.6 MB |
+| 20 日换手率面板 | `curated/fundamentals/turnover_daily.parquet` | 576 只 / 427,749 行 | 2023-04-03 | **2026-11-13** | 1.3 MB |
 | 总股本（季报） | `curated/fundamentals/shares_outstanding.parquet` | 501 只 / 49,338 行 | 披露 2009-04-15 | 披露 **2026-11-13** | 0.4 MB |
 | 全市场快照 | `meta/universe/universe_latest.parquet` | 1,000 行 | — | as of **2026-11-16** | 0.0 MB |
 
@@ -34,7 +34,7 @@
 
 列 `date / symbol / turnover`；市值门槛反推股本、20 日均换手率排序都靠它。
 
-- 标的数：564，合计 427,733 行
+- 标的数：576，合计 427,749 行
 - 日期范围：2023-04-03 ~ 2026-11-13
 
 ### 总股本 `curated/fundamentals/shares_outstanding.parquet`
@@ -54,7 +54,7 @@
 
 ### 成分股快照 `ref/us_sector_holdings.csv`
 
-- 不存在（运行时退回 config/ref 的静态快照，不影响使用）
+- 行数：503，as of 2026-11-12
 
 ## 这个分支里没有的东西
 
