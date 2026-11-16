@@ -60,7 +60,6 @@ def _run(
     plan: list[tuple[str, pd.Timestamp]],
     end: pd.Timestamp,
     chain: list[BarSource],
-    state: dict,
     batch_size: int,
     sleep_s: float,
 ) -> dict:
@@ -84,16 +83,6 @@ def _run(
             res = store.upsert_bars(
                 sym, df, tolerance=get_settings().data.revision_tolerance, source=src_name
             )
-            state[sym] = {
-                "last_date": res.last_date,
-                "last_close": res.last_close,
-                "last_adj_close": res.last_adj_close,
-                "rows": res.total_rows,
-                "source": src_name,
-                "status": "ok",
-                "error": "",
-                "updated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-            }
             stats["new_rows"] += max(res.new_rows, 0)
             stats["symbols"] += 1
             if res.revised:
@@ -101,15 +90,8 @@ def _run(
                 log.warning("%s 检测到历史价格漂移 %.4f%%，需全量重刷", sym, res.max_rel_diff * 100)
 
         for sym in failed:
-            prev = state.get(sym, {})
-            state[sym] = {
-                **prev,
-                "status": "failed",
-                "updated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-            }
             stats["failed"].append(sym)
 
-        store.write_state(state)
         if idx < total and sleep_s:
             time.sleep(sleep_s)
 
@@ -143,12 +125,11 @@ def backfill(
 
     plan = [(sym, start_ts) for sym in symbols]
     chain = build_chain()
-    state = store.read_state()
     log.info("回填 %d 只，%s ~ %s，数据源链: %s", len(symbols), start_ts.date(), end_ts.date(),
              [s.name for s in chain])
 
     stats = _run(
-        plan, end_ts, chain, state,
+        plan, end_ts, chain,
         batch_size=cfg.data.batch_size, sleep_s=cfg.data.sleep_between_batches,
     )
     log.info(
@@ -166,7 +147,6 @@ def update(symbols: Sequence[str] | None = None, end: str | None = None) -> dict
 
         symbols = universe.get_symbols()
 
-    state = store.read_state()
     last = store.last_dates()
     end_ts = pd.Timestamp(end or date.today()).normalize()
     lookback = pd.Timedelta(days=cfg.data.incremental_lookback_days)
@@ -181,7 +161,7 @@ def update(symbols: Sequence[str] | None = None, end: str | None = None) -> dict
     chain = build_chain()
     log.info("增量 %d 只，截止 %s", len(plan), end_ts.date())
     stats = _run(
-        plan, end_ts, chain, state,
+        plan, end_ts, chain,
         batch_size=cfg.data.batch_size, sleep_s=cfg.data.sleep_between_batches,
     )
 
