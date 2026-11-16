@@ -216,6 +216,7 @@ def _alpaca_close_et(d: dt.date) -> tuple[dt.time | None, str] | None:
     except Exception:                               # noqa: BLE001  配置缺失不该影响主流程
         return None
     if not key or not secret:
+        log.info("Alpaca 日历跳过：密钥为空")
         return None
 
     # 免费账户的密钥一般配在 paper 环境，两个域名都试一次
@@ -234,13 +235,17 @@ def _alpaca_close_et(d: dt.date) -> tuple[dt.time | None, str] | None:
                      getattr(exc, "code", type(exc).__name__))
             continue
         if not isinstance(rows, list):
+            log.info("Alpaca 日历返回非列表 %s：%s", host,
+                     str(rows)[:160])
             continue
         if not rows:
             return None, "alpaca 判定当日休市"
         close = str((rows[0] or {}).get("close") or "")
         if len(close) >= 5 and close[:2].isdigit():
             return dt.time(int(close[:2]), int(close[3:5])), f"alpaca 收盘 {close} ET"
+        log.info("Alpaca 日历 close 字段不可解析 %s：%s", host, str(rows[0])[:160])
         return None
+    log.info("Alpaca 日历两个域名都不可用")
     return None
 
 
