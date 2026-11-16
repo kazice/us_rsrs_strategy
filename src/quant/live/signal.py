@@ -44,8 +44,7 @@ TURN_CAP = 0.20
 TURNMA_TOP = 3
 TURNMA_SECTORS = 3
 HISTORY_DAYS = 400          # 预热：60 个交易日窗口 + 节假日余量，取 400 自然日足够
-STALE_BAR_TOL = 1e-3        # high/low/收盘 与上一根 bar 的相对容差（不同数据源会有尾数差）
-STALE_BAR_MIN_COVER = 0.5   # 这个比例的标的都"和昨天一模一样" → 判定报价没更新
+QUOTE_RANGE_MIN_COVER = 0.5  # 这个比例的报价要有 high>low，否则判为「当日 bar 还没形成」
 
 
 def project_root() -> Path:
@@ -124,39 +123,66 @@ class Signal:
         return not self.pick
 
 
-def _stale_quote_cover(quotes: dict[str, Quote], prev_hi: pd.Series, prev_lo: pd.Series,
-                       prev_close: pd.Series, tol: float = STALE_BAR_TOL) -> tuple[float, int]:
-    """报价里有多少只标的的 high/low/收盘与上一根 bar 完全一致。
+def _quote_session(quotes: dict[str, Quote]) -> dt.date | None:
+    """报价所属的交易日（ET 日期），取时间戳最新的那条。没时间戳就返回 None。"""
+    stamps = [q.ts for q in quotes.values() if getattr(q, "ts", None) is not None]
+    if not stamps:
+        return None
+    latest = max(stamps)
+    if latest.tzinfo is not None:
+        latest = latest.astimezone(calendar_mod.ET)
+    return latest.date()
 
-    命中率接近 1 只可能是同一件事：数据源还没轮到新交易日，返回的是**上一交易日的收盘快照**。
-    这时把报价合成成今日 bar，等于在面板尾部复制了一根昨天的 bar；RSRS 是 20 日回归 +
-    40 日标准化，复制的那一根会把 R² 拉向 1，整张板块排序会被改写（实测 11-13 的 XLP 1.06
-    会被算成 0.44），于是选出一只完全不相干的票。
+
+def _quote_range_cover(quotes: dict[str, Quote]) -> tuple[float, int]:
+    """报价里有多少比例带真实日内区间（high > low）。
+
+    数据源在开盘前会返回 high == low == 上一交易日收盘（时间戳还标成 09:30），这时
+    "今日 bar" 退化成一个点：RSRS 的 20 日回归里多一个点，R² 被拉向 1、β 变形，
+    板块排序整体改写。看区间比看时间戳可靠——时间戳在开盘前也是 09:30。
     """
-    same = checked = 0
-    for s, q in quotes.items():
-        if s not in prev_close.index:
-            continue
-        c, h, l = prev_close.get(s), prev_hi.get(s), prev_lo.get(s)
-        if not (np.isfinite(c) and np.isfinite(h) and np.isfinite(l)) or min(c, h, l) <= 0:
-            continue
-        if not (q.price > 0 and (q.high or 0) > 0 and (q.low or 0) > 0):
+    covered = checked = 0
+    for q in quotes.values():
+        if not (q.price > 0 and q.high and q.low):
             continue
         checked += 1
-        if (abs(q.price / c - 1) <= tol and abs(q.high / h - 1) <= tol
-                and abs(q.low / l - 1) <= tol):
-            same += 1
-    return (same / checked if checked else 0.0), checked
+        if q.high > q.low:
+            covered += 1
+    return (covered / checked if checked else 0.0), checked
 
 
 def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
                      quotes: dict[str, Quote], asof: pd.Timestamp,
-                     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    """把今日报价合成成一根 bar 追加到面板尾部（面板原有的同日行先剔除）。
+                     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float], str]:
+    """把信号日那根 bar 补齐到面板尾部，返回 (px, hi, lo, 复权因子, 该 bar 的来源)。
 
-    复权因子取最近一个交易日的 ``adj_close / close``：今日报价是未复权价，
-    乘上它才和面板里的 adj_close 同口径。除权当天因子会跳变，但一天之内不影响排序。
+    以日线实际数据为准，分两种情形：
+
+    - **日线里已经有这一天的 bar**（决策在收盘后跑，或历史时点复现）→ 直接用日线，
+      不拿报价去覆盖它。报价是盘中快照，覆盖过去等于把已确定的收盘数据改小。
+    - **日线只到前一交易日**（盘中 15:30 决策的正常情形）→ 用报价合成当日 bar，但前提是
+      报价确实属于信号日这个交易日。报价的交易日取自它自己的时间戳；对不上就说明数据源
+      还没翻页（拿到的是上一交易日的收盘快照），此时合成等于在面板尾部复制一根昨天的 bar，
+      20 日回归的 R² 会被拉向 1，板块排序整体改写（实测 11-13 的 XLP 1.06 会被算成 0.44，
+      选出的票从 MNST 变成 APP）。这种情形一律拒绝，不做相似度猜测。
+
+    复权因子取最近一个交易日的 ``adj_close / close``：报价是未复权价，乘上它才和面板里的
+    adj_close 同口径。除权当天因子会跳变，但一天之内不影响排序。
     """
+    last_bar = px.index.max() if len(px.index) else None
+    asof = pd.Timestamp(asof).normalize()
+
+    if last_bar is not None and pd.Timestamp(last_bar).normalize() >= asof:
+        # 日线已覆盖信号日：以实际日线为准
+        px = px[px.index <= asof].copy()
+        hi = hi[hi.index <= asof].copy()
+        lo = lo[lo.index <= asof].copy()
+        last_close = store.load_panel(field="close", symbols=list(px.columns),
+                                      start=str((asof - pd.Timedelta(days=20)).date()),
+                                      end=str(asof.date()))
+        factor = (px.iloc[-1] / last_close.iloc[-1]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        return px, hi, lo, {s: float(factor[s]) for s in factor.index}, "daily"
+
     px = px[px.index < asof].copy()
     hi = hi[hi.index < asof].copy()
     lo = lo[lo.index < asof].copy()
@@ -171,13 +197,23 @@ def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
         raise SystemExit("取不到最近收盘价，无法计算复权因子")
     factor = (px.iloc[-1] / last_close.iloc[-1]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
-    # 先用报价与上一根 bar 对一遍，拦掉「报价还停在上一交易日」的情况
-    cover, checked = _stale_quote_cover(quotes, hi.iloc[-1], lo.iloc[-1], last_close.iloc[-1])
-    if checked >= 20 and cover >= STALE_BAR_MIN_COVER:
+    session = _quote_session(quotes)
+    if session is None:
+        raise SystemExit("报价没有时间戳，无法确认它属于哪个交易日，拒绝合成当日 bar")
+    if pd.Timestamp(session) != asof:
         raise SystemExit(
-            f"报价疑似上一交易日的收盘快照：{cover:.0%} 的标的（{checked} 只）high/low/收盘与 "
-            f"{px.index[-1]:%Y-%m-%d} 完全相同。若按 {asof:%Y-%m-%d} 追加今日 bar，等于复制前一根，"
-            f"板块 RSRS 会被改写。请等数据源更新到 {asof:%Y-%m-%d} 再出信号"
+            f"报价的交易日是 {session}，信号日是 {asof:%Y-%m-%d}，日线最新 {px.index[-1]:%Y-%m-%d}："
+            f"信号日这根 bar 没有任何真实数据，用旧报价合成只会复制前一根、改写板块 RSRS。"
+            f"等数据源更新到 {asof:%Y-%m-%d} 再出信号"
+        )
+
+    range_cover, checked = _quote_range_cover(quotes)
+    if checked >= 20 and range_cover < QUOTE_RANGE_MIN_COVER:
+        raise SystemExit(
+            f"只有 {range_cover:.0%} 的报价（{checked} 只）带日内区间（high>low），其余是 "
+            f"high=low=收盘：{asof:%Y-%m-%d} 的当日 bar 还没形成（开盘前/集合竞价阶段，"
+            f"数据源会把 high/low 填成上一交易日收盘）。合成的 bar 是一个点，会让 RSRS 回归退化，"
+            f"拒绝出信号"
         )
 
     row_px, row_hi, row_lo = {}, {}, {}
@@ -199,7 +235,7 @@ def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
         hi.at[asof, s] = v
     for s, v in row_lo.items():
         lo.at[asof, s] = v
-    return px, hi, lo, {s: float(factor[s]) for s in factor.index}
+    return px, hi, lo, {s: float(factor[s]) for s in factor.index}, "quote"
 
 
 def _stack_ok(px: pd.DataFrame, asof: pd.Timestamp, sym: str) -> tuple[bool, dict[int, float]]:
@@ -267,7 +303,9 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
         notes.append(f"{len(no_quote)} 只无当日报价（今日 bar 用前值 ffill）："
                      f"{' '.join(no_quote[:10])}{' ...' if len(no_quote) > 10 else ''}")
 
-    px, hi, lo, factors = _append_live_row(px, hi, lo, quotes, asof)
+    px, hi, lo, factors, bar_src = _append_live_row(px, hi, lo, quotes, asof)
+    if bar_src == "daily":
+        notes.append(f"信号日 {asof:%Y-%m-%d} 已有实际日线，按日线口径计算（未用盘中报价覆盖）")
 
     etf_rsrs = rsrs_panel_fast(hi[SECTOR_ETFS], lo[SECTOR_ETFS], RSRS_N, RSRS_M, "strict")
     if asof not in etf_rsrs.index or etf_rsrs.loc[asof].dropna().empty:
