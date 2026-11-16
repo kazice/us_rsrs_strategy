@@ -129,6 +129,10 @@ jobs:
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
         run: python -m scripts.paper_close_update
+
+      - name: 生成数据说明（MANIFEST.md）
+        # 每次更新数据后原地重写 MANIFEST.md，跟着数据一起提交到 data 分支
+        run: python -m scripts.data_manifest
       - name: 回写 data 分支
         run: |
           cd data
