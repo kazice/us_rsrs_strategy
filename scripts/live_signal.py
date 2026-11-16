@@ -164,23 +164,76 @@ def render_rebalance(sig, action: str, action_detail: str, pos: books.Position,
     return title, "\n".join(lines)
 
 
+def _ma_txt(mas: dict, w: int) -> str:
+    v = mas.get(w)
+    return "—" if v is None or v != v else f"{v:.2f}"
+
+
+def _screen_lines(sig) -> list[str]:
+    """本期筛选明细：结论 + 板块 RSRS + 换手 TOP3 的均线 + 各层数量。
+
+    周报原先只报持仓，空仓时就两行，读的人分不清「没有合格标的」和「还没建仓」，
+    也看不到候选究竟卡在哪一步。这里把每一步的具体数字摊开。
+    """
+    out = ["", "**本期筛选**"]
+
+    if sig.pick:
+        rank = next((c.sector_rank for c in sig.candidates if c.symbol == sig.pick), 1)
+        rsrs = float(sig.sector_scores.get(sig.sector, float("nan")))
+        out.append(f"- 结论：**{sig.pick}**（{sig.sector}）满足全部条件\u2014\u2014"
+                   f"板块 RSRS 第 {rank}（{rsrs:.2f}），在换手 TOP3 内且 MA10>MA20>MA50；"
+                   f"参考价 ${sig.price:.2f}")
+    else:
+        out.append("- 结论：前三个板块 \u00d7 换手 TOP3 全部不满足 MA10>MA20>MA50，本期无合格标的")
+
+    top = signal_mod.top_sectors(sig)
+    out.append("- 板块 RSRS 前三：" + " / ".join(f"{s} {v:.2f}" for s, v in top))
+
+    if sig.candidates:
+        out += ["", "| 板块序 | 板块 | 代码 | 20日均换手 | MA10 | MA20 | MA50 | 多头排列 |",
+                "|---|---|---|---|---|---|---|---|"]
+        for c in sig.candidates[:9]:
+            out.append(f"| {c.sector_rank} | {c.sector} | {c.symbol} | {c.turnover:.2%} | "
+                       f"{_ma_txt(c.ma, 10)} | {_ma_txt(c.ma, 20)} | {_ma_txt(c.ma, 50)} | "
+                       f"{'\u2713' if c.ok else '\u2717'} |")
+
+    tbl = sig.pool_table
+    if len(tbl):
+        cap_ok = tbl["mcap_ok"] == True                    # noqa: E712  列里是 object 布尔
+        turn_ok = tbl["turn_ok"] == True                   # noqa: E712
+        stack_ok = tbl["stack_ok"] == True                 # noqa: E712
+        both = cap_ok & turn_ok
+        cap_txt = "市值不限" if not sig.min_mcap else f"过市值门槛 {int(cap_ok.sum())} 只"
+        out.append("")
+        out.append(f"- 数量：候选池 {len(tbl)} 只 \u2192 {cap_txt} "
+                   f"\u2192 再过滤换手 {int(both.sum())} 只 "
+                   f"\u2192 MA 多头排列 {int((both & stack_ok).sum())} 只 "
+                   f"\u2192 进板块 TOP3 {int((tbl['in_top3'] == True).sum())} 只 "  # noqa: E712
+                   f"\u2192 选中 {int((tbl['selected'] == True).sum())} 只")  # noqa: E712
+        out.append(f"- 参考：全池 MA 多头排列共 {int(stack_ok.sum())} 只"
+                   f"（含未过市值/换手门槛的）")
+    return out
+
+
 def render_week(sig, pos: books.Position, holding_ret: float | None, ctx: dict,
                 pctx: dict) -> tuple[str, str]:
     nxt = _next_rebalance(sig.asof.date())
     title = f"[模拟盘] {sig.asof:%m-%d} 周报"
+    body = [f"## {sig.asof:%Y-%m-%d} 周报", ""]
     if pos.is_empty():
-        body = [f"## {sig.asof:%Y-%m-%d} 周报", "", "**当前空仓**。",
-                f"下个调仓日：{nxt:%Y-%m-%d}（收盘前 30 分钟）"]
+        body.append("**当前空仓**：账本尚无持仓 \u2014\u2014 本策略只在月末最后交易日建仓，周报只报不平账。")
+        body.append(f"- 下个调仓日：{nxt:%Y-%m-%d}（收盘前 30 分钟）")
+        if sig.pick:
+            body.append(f"- 若今日就是调仓日，会买入：{sig.pick}（{sig.sector}）")
     else:
-        body = [
-            f"## {sig.asof:%Y-%m-%d} 周报",
-            "",
+        body += [
             f"**持仓**：{pos.symbol}（{pos.sector}）",
             f"- 建仓：{pos.entry_date} @ ${pos.entry_price:.2f}",
             f"- 持有期收益：{_fmt_pct(holding_ret)}",
             f"- 累计净值：{pos.nav:.4f}",
             f"- 下个调仓日：{nxt:%Y-%m-%d}（收盘前 30 分钟）",
         ]
+    body += _screen_lines(sig)
     body += _pool_lines(pctx)
     body += ["", "---", f"报价滞后 {ctx['lag']}；换手率覆盖 {ctx['turn_cov']}。"]
     return title, "\n".join(body)
