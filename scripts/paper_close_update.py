@@ -31,6 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 from quant.data import fetch, store, universe
+from quant.data.sources.registry import build_chain
 from quant.live import calendar, pool, quotes
 from quant.live.signal import BENCH, SECTOR_ETFS
 
@@ -87,6 +88,13 @@ def main() -> int:
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+    # 先把「实际启用了哪些数据源」打出来。缺密钥时降级链会静默少一层（只剩 yahoo），
+    # 而 run log 只留 90 天，等出问题再回头查已经晚了。放在闸门之前，空跑也能看见。
+    try:
+        print(f"数据源链：{' → '.join(s.name for s in build_chain())}")
+    except Exception as exc:                        # noqa: BLE001
+        print(f"::warning::数据源链构建失败：{type(exc).__name__}（{exc}）")
 
     now = (dt.datetime.fromisoformat(args.now).replace(tzinfo=dt.timezone.utc)
            if args.now else dt.datetime.now(dt.timezone.utc))
