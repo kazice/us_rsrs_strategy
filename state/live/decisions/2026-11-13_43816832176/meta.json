@@ -1,0 +1,30 @@
+{
+  "run_id": "43816832176",
+  "ts_utc": "2026-11-16T06:27:28+00:00",
+  "ts_et": "2026-11-16T01:27:28-05:00",
+  "asof": "2026-11-13",
+  "kind": "week",
+  "dry_run": false,
+  "git_sha": "1797c227d644",
+  "pool": {
+    "size": 503,
+    "as_of": "2026-11-11"
+  },
+  "quotes": {
+    "count": 515,
+    "lag_min": 3444.3
+  },
+  "params": {
+    "rsrs_n": 20,
+    "rsrs_m": 40,
+    "stack": [
+      10,
+      20,
+      50
+    ],
+    "turn_cap": 0.2,
+    "turnma_top": 3,
+    "turnma_sectors": 3,
+    "min_mcap": 50000000000.0
+  }
+}
