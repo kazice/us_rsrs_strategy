@@ -65,6 +65,18 @@ class Quote:
         return (ref - self.ts).total_seconds() / 60.0
 
 
+def _variants(sym: str) -> list[str]:
+    """同一个代码在报价源的几种写法：BRK-B ↔ BRK.B。
+
+    库里统一用横杠（yahoo / Tiingo 口径），但腾讯、新浪的美股代码用点号，
+    拿 ``usBRK-B`` 去问只会返回空——不是报错，是**静默缺这一只**，所以两个都试。
+    """
+    out = [sym]
+    if "-" in sym:
+        out.append(sym.replace("-", "."))
+    return out
+
+
 def _http(url: str, headers: dict[str, str], timeout: float = 20.0) -> str:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -133,7 +145,8 @@ def tencent_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
     out: dict[str, Quote] = {}
     for i in range(0, len(symbols), TENCENT_BATCH):
         chunk = symbols[i: i + TENCENT_BATCH]
-        url = TENCENT_QUOTE.format(codes=",".join(f"us{s}" for s in chunk))
+        codes = [f"us{v}" for s in chunk for v in _variants(s)]
+        url = TENCENT_QUOTE.format(codes=",".join(codes))
         try:
             text = _http(url, _HEADERS_TENCENT)
         except Exception as exc:
@@ -165,8 +178,9 @@ def tencent_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
                 if lo_ and lo_ > 0:
                     low = lo_
                 turnover_pct, shares = _resolve_turnover(fields, idx, volume)
-            out[sym.upper()] = Quote(sym.upper(), price, prev, high, low, volume,
-                                     turnover_pct, shares, ts, "tencent")
+            key = sym.upper().replace(".", "-")     # 源用点号，本项目统一横杠
+            out[key] = Quote(key, price, prev, high, low, volume,
+                             turnover_pct, shares, ts, "tencent")
         if i + TENCENT_BATCH < len(symbols):
             time.sleep(pause)
     return out
@@ -176,7 +190,8 @@ def sina_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
     out: dict[str, Quote] = {}
     for i in range(0, len(symbols), SINA_BATCH):
         chunk = symbols[i: i + SINA_BATCH]
-        url = SINA_QUOTE.format(codes=",".join(f"gb_{s.lower()}" for s in chunk))
+        codes = [f"gb_{v.lower()}" for s in chunk for v in _variants(s)]
+        url = SINA_QUOTE.format(codes=",".join(codes))
         try:
             text = _http(url, _HEADERS_SINA)
         except Exception as exc:
@@ -205,8 +220,9 @@ def sina_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
             except (ValueError, IndexError):
                 pass
             shares = mktcap / price if price > 0 else 0.0
-            out[sym.upper()] = Quote(
-                sym.upper(), price, price - chg, high or price, low or price, volume,
+            key = sym.upper().replace(".", "-")
+            out[key] = Quote(
+                key, price, price - chg, high or price, low or price, volume,
                 (volume / shares * 100.0) if shares > 0 else 0.0, shares, ts, "sina")
         if i + SINA_BATCH < len(symbols):
             time.sleep(pause)
