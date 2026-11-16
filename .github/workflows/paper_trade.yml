@@ -39,6 +39,14 @@ on:
       dry_run:
         description: '只算不推（true/false）'
         default: 'false'
+      data_now:
+        description: 'data job 的复现时刻（UTC，如 2026-11-13 21:10；留空=系统时钟）'
+        default: ''
+      data_force:
+        description: 'data job 跳过收盘结算闸门（仅排错用，会按当前 ET 日期抓行情）'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 permissions:
   contents: write
@@ -146,7 +154,12 @@ jobs:
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
-        run: python -m scripts.paper_close_update
+        # data_now / data_force 都只给排错用：默认空/false，定时任务行为不变。
+        # --now 是 UTC 语义（与 live_signal 的 --now 按 ET 不同），给 21:10 就能过闸门并锁住交易日。
+        run: |
+          python -m scripts.paper_close_update \
+            ${{ github.event.inputs.data_now != '' && format('--now "{0}"', github.event.inputs.data_now) || '' }} \
+            ${{ github.event.inputs.data_force == 'true' && '--force' || '' }}
 
       - name: 生成数据说明（MANIFEST.md）
         # 每次更新数据后原地重写 MANIFEST.md，跟着数据一起提交到 data 分支
