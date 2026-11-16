@@ -41,7 +41,7 @@ Python 进程能正常读（白名单解密），所以**本地运行不受影�
 | 3. 板块层 RSRS | ETF 的 high/low | N=20 回归、M=40 标准化、strict 过滤 | 11 个板块的 z 值 | `rsrs_panel_fast` |
 | 4. 全池换手率 | 19 天面板 + 当日累计 | `(sum19 + today) / 20`，有效天数 ≥10 | 每只票的 20 日均换手 | `turnover.build` |
 | 5. 换手率上限 | 上一步 | 20 日均换手 > 20% 的票当期剔除 | 可排序池 | `signal.compute` |
-| 6. 市值门槛 | 未复权价 × 反推股本 | < 500 亿美元的票当期剔除（取不到市值的**保留**） | 可排序池 | `mcap.gate` |
+| 6. 市值门槛 | 未复权价 × **当日真实股本** | < 500 亿美元的票当期剔除（取不到市值的**保留**）；股本按 快照 → 换手率反推 → SEC 三级兜底，逐票留来源 | 可排序池 | `mcap.gate` |
 | 7. 板块下探 | 板块 RSRS 降序 | 最多看前 3 个板块；每板块内按换手率降序取前 3 只 | 至多 9 个候选 | `signal.compute` 循环 |
 | 8. 多头排列 | 候选的 MA10/20/50 | MA10 > MA20 > MA50；遇到第一个满足的就买入并停止下探 | 1 只或空仓 | `signal.ma_of` |
 | 9. 执行 | 15:30 现价 | 市价单、单票满仓、持有一个月、不设止损 | 持仓 | 人工 |
@@ -77,15 +77,25 @@ z = (raw − mean(raw.shift(1)[-M:])) / std(raw.shift(1)[-M:])
 
 分母是**当日总股本**（腾讯报价的换手率字段 = 成交量 ÷ 总股本，与回测的 ws 面板同源）。
 
-**市值（`mcap.shares_outstanding`）**
+**市值（`mcap.share_sources` / `mcap.gate`）**
 
 ```
-股本 = median( 每日成交量 ÷ 当日换手率 )      # 3 年窗口；缺换手率用 universe 快照的 市值/价格 兜底
-市值 = 当日未复权收盘价 × 股本
+股本 = ① 快照：universe_latest.parquet 的 market_cap ÷ price       # Nasdaq 官方，日更，前 1000 名
+       ② 反推：median(成交量 ÷ 当日换手率)，最近 20 个交易日        # 快照缺这个代码时用
+       ③ SEC ：filed ≤ asof 的最后一条申报股本，超过 400 天算过期    # 前两级都没有时用
+市值 = 当日未复权价 × 股本
 判定 = 市值 > 500e8（严格大于）
 ```
 
 用未复权价是必须的：复权价在拆股后会被缩放，市值会算错。
+
+**为什么不再用 3 年中位数**（2026-11 改口径）：中位数反映的是「过去三年的平均股本」，回购/增发/
+分拆之后就会偏离当期值。数据分支 503 只实测，500 亿门槛附近 14 只判定与真实市值相反
+（DD 510 亿 → 实际 204 亿、CVNA 487 亿 → 798 亿、KMB 363 亿 → 672 亿）。
+换手率反推口径本身没有丢，降级为「快照缺失时」的兜底（只取最近 20 日，避免把历史股本算进来）。
+
+**快照的 `asof` 是抓取日、按容器时区（UTC+8）记录**，会比 ET 交易日早 1 天左右；`mcap` 允许
+超前 2 天，超前更多判为「来自未来的快照」并弃用（用 `--now` 复现历史时点会踩到）。
 
 ### 1.4 为什么用"换手率"而不是 RSRS 排序选个股
 
@@ -170,7 +180,7 @@ journal.finish(0, "ok", detail)  # 写一行流水
 | `turnover.py` | 20 日均换手率：历史面板 + 当日累计 | `TurnoverResult` / `build` / `load_history` / `median_of` | `TAIL_FACTOR` 固定 1.0，**不要**把回测的 0.48 抄进来 |
 | `pool.py` | 候选池：SSGA 官方 holdings 刷新、调入调出日志、代码归一（`BRK.B`→`BRK-B`） | `load` / `refresh` / `RefreshResult` / `diff` / `recent_changes` / `normalize_symbol` | 刷新失败必须沿用旧快照，绝不中断信号 |
 | `signal.py` | **策略核心**：板块 RSRS → 换手率 → 市值门槛 → 多头排列 → 下探 | `compute` / `Signal` / `Candidate` / `_append_live_row` / `ma_of` / `top_sectors` | 改排序逻辑只改这里；`pool_table` 是日志用的全池表，别删 |
-| `mcap.py` | 500 亿美元市值门槛，与回测 `--min-mcap` 同口径 | `MIN_MCAP` / `shares_outstanding` / `gate` / `Gate` | 股本用"成交量÷换手率"的中位数，**不要**换成 SEC 表（会造成两边不一致） |
+| `mcap.py` | 500 亿美元市值门槛，市值用**当日真实股本**（快照 → 反推 → SEC） | `MIN_MCAP` / `share_sources` / `gate` / `Gate` | 三级兜底的**顺序不能调**：SEC 表有洞（CHTR 最后一条停在 2016、FOX/A 值是 1 股），只配当最后兜底 |
 | `books.py` | 持仓、流水、幂等键；净值按"上一期实际收益"滚动 | `Position` / `load_position` / `plan_action` / `mark_to_market` / `record` / `already_pushed` | 「继续持有」也要记一行，否则净值曲线断档 |
 | `notify.py` | pushplus 推送，2000 字上限，以响应体 `code` 判成功 | `send` / `token` | 失败要打 `::error::` 让 job 变红 |
 | `journal.py` | 运行流水 + 决策快照 | `Journal` / `run_id` / `snapshot` / `finish` / `patch_decision` / `all_runs` | 先快照后推送；tmp+rename；路径存 posix |
@@ -231,7 +241,8 @@ Position      # 账本里的持仓
   nav, last_mark_date, last_mark_adj, moves, history
 
 Gate          # 市值门槛结果
-  kept, dropped(市值不足), unknown(取不到市值→保留), caps(每只市值), notes
+  kept, dropped(市值不足), unknown(取不到市值→保留), caps(每只市值),
+  srcs(每只的市值来源 snapshot/ws/sec), snapshot_as_of, notes
 
 TurnoverResult
   mean(20日均值), today(当日), days(有效天数), notes, asof
@@ -257,7 +268,8 @@ curated/fundamentals/turnover_daily.parquet   换手率：symbol/date/turnover(�
 ref/us_sector_holdings.csv                    成分股快照：symbol/sector_etf/... /as_of
 ref/index_changes.csv                         调仓日志：date/action/symbol/sector_etf/note
 ref/history/us_sector_holdings_<asof>.csv     每次刷新留档
-meta/universe/universe_latest.parquet         市值/价格快照（股本兜底）
+meta/universe/universe_latest.parquet         市值/价格快照（Daily，市值的主来源）
+curated/fundamentals/shares_outstanding.parquet  SEC 申报股本（仅市值最后兜底；表有洞，别当主源）
 state/live/positions.json                     当前持仓
 state/live/pushed.json                        幂等键
 state/live/ledger.csv                         历史流水
@@ -290,7 +302,7 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 | # | 现象 | 原因 | 怎么处理 |
 |---|---|---|---|
 | 1 | 实盘选股比回测偏保守 | 实盘的成分股是**当前快照**，回测是 `--pool-mode pit` 按公告重建的逐日名单 | 只对"同月是否选同一只"这种粒度，不对逐日曲线 |
-| 2 | 市值估计与真实值差 ~20% | 回测的股本用**全样本**中位数（含未来数据），实盘只能用截至当日 | 已知前视，实测影响 0.95% 的"票·期"判定，36 期实际持仓未变；要彻底修就改回测窗口后重跑五档 |
+| 2 | 实盘与回测在 500 亿门槛附近判定不一致 | 回测的 `--min-mcap` 用全样本中位数或当日快照（含前视），实盘用当日真实股本（快照/反推/SEC） | 503 只实测：500 亿档有 **14 只**判定翻转（DD、CVNA、KMB 等拆股/股本变动票）。引用历史收益时必须说明；要对齐就把回测的 `--min-mcap` 股本也换成同一套 |
 | 3 | 实盘换手率比回测低一半 | 把回测的 `--turn-tail 0.48` 也乘进了实盘 | 实盘 `TAIL_FACTOR=1.0`，不要再折 |
 | 4 | 某只票在回测里有、实盘没有 | `BRK-B`/`BF-B` 这类代码在行情源缺失，实盘会剔除并在推送里列出 | 补行情；不要静默丢弃（推送里必须露出来） |
 | 5 | 净值对不上 | "继续持有"的期没记流水，或周报重复记收益 | 净值只在**调仓**时滚一次；周报只报不平账 |
@@ -301,6 +313,9 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 | 10 | 本地跑 CLI 报 `UnicodeEncodeError: 'gbk'` | Windows 控制台默认 GBK，推送正文里有 `✓` | `set PYTHONUTF8=1`；CI 是 Linux 不受影响 |
 | 11 | 复制出去的 `.py` 是乱码 | 公司加密软件按扩展名加密 | 改成 `.txt` 再复制（见第 0 节） |
 | 12 | 早收日（感恩节次日/7-3/平安夜）错过窗口 | 时钟没按当日实际收盘算 | 一律走 `calendar.session_close_et`，不要写死 16:00 ET |
+| 13 | 市值突然整批变了 | 快照 `asof` 是抓取日（容器 UTC+8），比 ET 交易日早 1 天；或快照没刷新 | 看推送里的「市值来源：快照 N / 反推 N（快照 as of …）」；`asof` 超前 >2 天会被判为未来快照而弃用 |
+| 14 | 信号用的是几天前的收盘 | data job 挂了，bars 面板没更新，而报价是实时的 | `Signal.data_lag_days` 会随推送露出；缺 2 个交易日以上直接 abort（`DATA_LAG_ABORT_TD`），缺 1 天只告警 |
+| 15 | 选出一只完全不相干的票 | 报价还停在**上一交易日收盘**（数据源没更新），却被当成今日 bar 追加 → 面板里出现两根一样的 bar，RSRS 的 R² 被拉向 1，板块排序整体改写（实测 11-13 的 XLP 1.06 会被算成 0.44，MNST 变 APP） | `signal._stale_quote_cover`：≥20 只标的的 high/low/收盘与上一根 bar 一致且占比 ≥50% 就 abort。**只在 `--now` 复现时容易踩**，真实运行还有 45 分钟报价滞后硬闸兜着 |
 
 ---
 
@@ -318,7 +333,9 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 | 事项 | 状态 |
 |---|---|
 | 模拟盘尚未真实跑过 | `state/live` 下没有账本，首期建仓等 2026-11-30 |
-| 回测的股本估计含前视 | 未修（影响 0.95% 的边缘票判定，36 期持仓未变）。修法：把 `--min-mcap` 的股本窗口改成"截至信号日"后重跑五档对比 |
+| 回测的股本估计含前视 | 实盘已改（市值改用当日真实股本），回测未改；要对齐需把回测 `--min-mcap` 的股本换成同一套后重跑五档。现状是两边在门槛附近 14 只票上判定不同 |
+| data job 断档会静默用旧收盘 | 已修：`signal.trading_lag_days` 数缺口，缺 1 天告警、缺 ≥2 天中止（`live_signal.DATA_LAG_ABORT_TD`） |
+| 报价停在上一交易日时会复制出一根假 bar | 已修：`signal._stale_quote_cover` 比对报价与上一根 bar，命中率 ≥50% 直接 abort |
 | 收益高度集中 | 2024-11 APP 单独占 29% 对数收益，前 3 期占 61%。这不是 bug，但任何"提升稳定性"的改造都要先量化它对这几期的影响 |
 | `--gaps` 只查月频调仓 | 周报不查（漏发影响小） |
 | `--replay` 的成员名单用的是当前快照 | 只能验证"同输入同输出"，不能还原"当时的名单" |
@@ -345,8 +362,8 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 
 ## 10. 禁止事项
 
-1. **不要用未来数据做判断**。任何"当期"字段只能用截至信号日的信息；市值门槛已有前视问题，
-   不要再引入新的。
+1. **不要用未来数据做判断**。任何"当期"字段只能用截至信号日的信息（市值门槛的快照已按 `asof`
+   拦未来快照），不要再引入新的前视。
 2. **不要在没有随机对照的情况下声张 alpha**。这个项目的验收标准是"优于随机/优于基准"，
    不是"回测曲线好看"。
 3. **不要按收益挑参数**。市值门槛的阈值扫描已经证明收益不单调（500 亿最好、300 亿最差），
@@ -394,5 +411,5 @@ python -m scripts.live_audit --replay --date 2026-11-10
 |---|---|
 | `docs/PAPER_TRADING.md` | 模拟盘运行机制、候选池、与回测的口径差异、上线配置 |
 | `docs/LIVE_LOG.md` | 日志系统的目录、字段、命令、13 条注意事项、排查顺序 |
-| `docs/PROGRESS.md` | 变更台账（每次改动一条，含 500 亿门槛与日志系统的决策过程） |
+| `docs/HANDOFF.md` | 本文：策略核心、文件地图、口径陷阱 |
 | `README.md` | 仓库概览与本机运行 | 

@@ -6,7 +6,8 @@
 
 口径逐项对齐（任何一项不同都会让信号偏离定稿）：
 - 板块层 RSRS：同一份 ``rsrs_panel_fast``，N=20 / M=40 / strict；
-- 市值门槛：候选池先按 **500 亿美元**过滤（``--min-mcap 500``，见 ``quant.live.mcap``）；
+- 市值门槛：候选池先按 **500 亿美元**过滤（``--min-mcap 500``，见 ``quant.live.mcap``），
+  市值用**当日真实股本**（全市场快照 → 换手率反推 → SEC 申报，逐级兜底并留来源标记）；
 - 个股层排序：20 日均换手率降序（ws 口径），超 20% 上限的票当期剔除；
 - 多头排列：MA10 > MA20 > MA50（``--trend-mode ma_stack --stack-order desc``）；
 - 下探：按板块 RSRS 顺序最多看 3 个板块，每板块看换手率前 3 只；
@@ -18,6 +19,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from quant.data import store
+from quant.live import calendar as calendar_mod
 from quant.live import mcap as mcap_mod
 from quant.live import pool as pool_mod
 from quant.live import turnover as turnover_mod
@@ -41,6 +44,8 @@ TURN_CAP = 0.20
 TURNMA_TOP = 3
 TURNMA_SECTORS = 3
 HISTORY_DAYS = 400          # 预热：60 个交易日窗口 + 节假日余量，取 400 自然日足够
+STALE_BAR_TOL = 1e-3        # high/low/收盘 与上一根 bar 的相对容差（不同数据源会有尾数差）
+STALE_BAR_MIN_COVER = 0.5   # 这个比例的标的都"和昨天一模一样" → 判定报价没更新
 
 
 def project_root() -> Path:
@@ -55,6 +60,32 @@ def load_members() -> pd.DataFrame:
     ``compute`` 显式剔出并写进推送备注，人能看到「它进池了但没数据，去补」。
     """
     return pool_mod.load()
+
+
+def trading_lag_days(last_bar, asof) -> int:
+    """``last_bar`` 与信号日**之间**还有几个交易日的数据没到。
+
+    只数中间缺口，不含信号日本身：当天的 bar 本来就要用实时报价合成，所以
+    「面板停在上一交易日」= 0（正常），缺 1 个交易日 = 1，以此类推。
+
+    为什么要单独算这个：``_append_live_row`` 只会把「今天」拼到面板尾部，中间的缺口
+    不补也不报错；data job 连挂几天时，板块 RSRS 与均线会静默用几天前的收盘价，
+    而推送正文里看不出任何异常。所以这里按内置交易日历数缺口，交给调用方决定要不要中止。
+    """
+    if last_bar is None or pd.isna(last_bar):
+        return 0
+    last = pd.Timestamp(last_bar).date()
+    end = pd.Timestamp(asof).date()
+    if end <= last:
+        return 0
+    n, d = 0, last + dt.timedelta(days=1)
+    for _ in range(400):
+        if d >= end:                    # 信号日本身不算缺口
+            break
+        if calendar_mod.is_trading_day(d):
+            n += 1
+        d += dt.timedelta(days=1)
+    return n
 
 
 @dataclass
@@ -84,11 +115,38 @@ class Signal:
     pool_size: int = 0
     pool_as_of: str = ""
     min_mcap: float = 0.0          # 候选池市值门槛（美元），0 = 不限
+    data_lag_days: int = 0         # 行情面板落后信号日几个交易日（0 = 到上一交易日，正常）
+    data_last_bar: pd.Timestamp | None = None
     pool_table: pd.DataFrame = field(default_factory=pd.DataFrame)   # 全池候选表，供日志落盘
 
     @property
     def is_cash(self) -> bool:
         return not self.pick
+
+
+def _stale_quote_cover(quotes: dict[str, Quote], prev_hi: pd.Series, prev_lo: pd.Series,
+                       prev_close: pd.Series, tol: float = STALE_BAR_TOL) -> tuple[float, int]:
+    """报价里有多少只标的的 high/low/收盘与上一根 bar 完全一致。
+
+    命中率接近 1 只可能是同一件事：数据源还没轮到新交易日，返回的是**上一交易日的收盘快照**。
+    这时把报价合成成今日 bar，等于在面板尾部复制了一根昨天的 bar；RSRS 是 20 日回归 +
+    40 日标准化，复制的那一根会把 R² 拉向 1，整张板块排序会被改写（实测 11-13 的 XLP 1.06
+    会被算成 0.44），于是选出一只完全不相干的票。
+    """
+    same = checked = 0
+    for s, q in quotes.items():
+        if s not in prev_close.index:
+            continue
+        c, h, l = prev_close.get(s), prev_hi.get(s), prev_lo.get(s)
+        if not (np.isfinite(c) and np.isfinite(h) and np.isfinite(l)) or min(c, h, l) <= 0:
+            continue
+        if not (q.price > 0 and (q.high or 0) > 0 and (q.low or 0) > 0):
+            continue
+        checked += 1
+        if (abs(q.price / c - 1) <= tol and abs(q.high / h - 1) <= tol
+                and abs(q.low / l - 1) <= tol):
+            same += 1
+    return (same / checked if checked else 0.0), checked
 
 
 def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
@@ -112,6 +170,15 @@ def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
     if last_close.empty:
         raise SystemExit("取不到最近收盘价，无法计算复权因子")
     factor = (px.iloc[-1] / last_close.iloc[-1]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    # 先用报价与上一根 bar 对一遍，拦掉「报价还停在上一交易日」的情况
+    cover, checked = _stale_quote_cover(quotes, hi.iloc[-1], lo.iloc[-1], last_close.iloc[-1])
+    if checked >= 20 and cover >= STALE_BAR_MIN_COVER:
+        raise SystemExit(
+            f"报价疑似上一交易日的收盘快照：{cover:.0%} 的标的（{checked} 只）high/low/收盘与 "
+            f"{px.index[-1]:%Y-%m-%d} 完全相同。若按 {asof:%Y-%m-%d} 追加今日 bar，等于复制前一根，"
+            f"板块 RSRS 会被改写。请等数据源更新到 {asof:%Y-%m-%d} 再出信号"
+        )
 
     row_px, row_hi, row_lo = {}, {}, {}
     for s, q in quotes.items():
@@ -150,14 +217,19 @@ def _stack_ok(px: pd.DataFrame, asof: pd.Timestamp, sym: str) -> tuple[bool, dic
 
 def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
             quote_notes: dict[str, str] | None = None,
+            allow_snapshot_ahead: bool = False,
             ) -> Signal:
-    """算当期目标持仓。``quotes`` 至少要覆盖 11 只板块 ETF + 候选个股。"""
+    """算当期目标持仓。``quotes`` 至少要覆盖 11 只板块 ETF + 候选个股。
+
+    ``allow_snapshot_ahead`` 只给 ``live_audit --replay`` 用（历史时点复算时允许用
+    今天的全市场快照取股本），正常出信号必须保持 False，否则会引入前视。
+    """
     from scripts.sector_stock_rsrs import rsrs_panel_fast
 
     asof = pd.Timestamp(asof).normalize()
     members = load_members()
     if members.empty:
-        raise SystemExit("成分股与本地行情池交集为空，先跑 scripts.build_universe / backfill")
+        raise SystemExit("成分股表为空：data 分支的 ref/us_sector_holdings.csv 缺失或损坏")
 
     sec_of = dict(zip(members["symbol"], members["sector_etf"]))
     stocks = list(members["symbol"])
@@ -169,6 +241,11 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     px = store.load_panel(field="adj_close", symbols=syms, start=start, end=str(asof.date())).sort_index()
 
     notes: list[str] = []
+    last_bar = px.index.max() if len(px.index) else None
+    lag_days = trading_lag_days(last_bar, asof)
+    if lag_days:
+        notes.append(f"⚠ 行情面板最新 {last_bar:%Y-%m-%d}，落后信号日 {lag_days} 个交易日："
+                     f"板块 RSRS 与均线用的是旧收盘，本期信号仅供参考")
     stocks_missing: list[str] = []          # 有成分没本地行情，审计时要单独标出来
     missing = [s for s in syms if s not in px.columns]
     if missing:
@@ -212,7 +289,8 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     # 价用盘中实时价（未复权），股本由 成交量/换手率 反推；取不到市值的票保留，
     # 与回测「拿不到市值不剔除」保持一致。没有当日报价的票没有价，自然落在保留侧。
     px_now = pd.Series({s: q.price for s, q in quotes.items()}, dtype="float64")
-    mgate = mcap_mod.gate(stocks, px_now, asof)
+    mgate = mcap_mod.gate(stocks, px_now, asof,
+                          allow_snapshot_ahead=allow_snapshot_ahead)
     if mgate.active:
         notes += mgate.notes
     eligible = [s for s in mgate.kept if s in turn_ok.index]
@@ -290,6 +368,7 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
         rows.append({
             "symbol": sym, "sector": sec_of.get(sym, ""),
             "price": price, "turnover20": t20, "mcap": cap,
+            "mcap_src": str(mgate.srcs.get(sym, "")) if len(mgate.srcs) else "",
             "mcap_ok": sym in mgate.kept, "turn_ok": sym in turn_ok.index,
             "ma10": mas.get(10, np.nan), "ma20": mas.get(20, np.nan),
             "ma50": mas.get(50, np.nan), "stack_ok": ok_stack,
@@ -306,7 +385,8 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
                   pool_size=len(members),
                   pool_as_of=str(members["as_of"].dropna().iloc[0])
                   if "as_of" in members.columns and members["as_of"].notna().any() else "",
-                  min_mcap=mcap_mod.MIN_MCAP, pool_table=pool_table)
+                  min_mcap=mcap_mod.MIN_MCAP, pool_table=pool_table,
+                  data_lag_days=lag_days, data_last_bar=last_bar)
 
 
 def top_sectors(signal: Signal, n: int = 3) -> list[tuple[str, float]]:

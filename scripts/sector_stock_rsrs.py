@@ -55,47 +55,6 @@ def rsrs_panel_fast(high: pd.DataFrame, low: pd.DataFrame, n: int, m: int,
     return (s - s.rolling(m).mean()) / s.rolling(m).std(ddof=0)
 
 
-def load_revenue() -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """季度营收 → {symbol: (filed 日期数组, end 日期数组, 数值数组)}，按 end 升序。
-
-    已按 (symbol, start, end) 只保留最早 filed 的那条，即「当时第一次公布的值」。
-    """
-    path = ROOT / "data" / "curated" / "fundamentals" / "revenue_quarterly.parquet"
-    if not path.exists():
-        raise SystemExit(f"营收数据不存在，先跑 scripts.build_revenue_fundamentals：{path}")
-    rev = pd.read_parquet(path).sort_values(["symbol", "end"])
-    return {sym: (g["filed"].values.astype("datetime64[ns]"),
-                  g["end"].values.astype("datetime64[ns]"),
-                  g["val"].to_numpy(dtype=float))
-            for sym, g in rev.groupby("symbol")}
-
-
-def rev_cagr(look: dict, sym: str, sig: pd.Timestamp) -> float:
-    """截至信号日 sig 的营收复合增速：最近一期单季营收 vs 同季度 N 年前。
-
-    只用 filed ≤ sig 的记录（杜绝未来数据）。优先 3 年 CAGR，其次 2 年，退化为 1 年同比。
-
-    为什么不用 TTM（最近 4 个季度相加）：SEC 数据里 Q4 单季经常缺失（10-K 只提交
-    12 个月累计值），拼 4 个季度会漏掉 Q4、把 TTM 低估约 1/4。改成「同一季度比同一
-    季度」，不受缺季影响，也顺带消掉了季节性。
-    """
-    if sym not in look:
-        return np.nan
-    filed, ends, val = look[sym]
-    m = filed <= np.datetime64(sig)
-    v, e = val[m], ends[m]
-    if len(v) < 5 or v[-1] <= 0:
-        return np.nan
-    days = (e - e[-1]) / np.timedelta64(1, "D")
-    for years in (3, 2, 1):
-        target = -365.25 * years
-        j = int(np.argmin(np.abs(days - target)))
-        if abs(days[j] - target) > 60 or v[j] <= 0:
-            continue
-        return float((v[-1] / v[j]) ** (1.0 / years) - 1.0)
-    return np.nan
-
-
 def mcap_pool_mask(stocks: list[str], cal: pd.DatetimeIndex,
                    start: str, end: str, top_n: int = 500,
                    shares_src: str = "current") -> pd.DataFrame:
@@ -247,23 +206,20 @@ def main() -> int:
     ap.add_argument("--end", default="2026-10-26")
     ap.add_argument("--freq", default="M", choices=["M", "W", "H", "M2"])
     ap.add_argument("--pick", default="rsrs",
-                    choices=["rsrs", "mcap", "mmin", "turn", "rev", "dvol", "dvolcv", "dvolcvh",
+                    choices=["rsrs", "mcap", "mmin", "turn", "dvol", "dvolcv", "dvolcvh",
                              "cvdown", "turnma"],
                     help="板块内选股规则：rsrs 分数最高 / mcap 市值最大 / mmin 市值最小 / "
-                         "turn 近 20 日平均换手率排名 / rev 营收复合增速最高 / "
+                         "turn 近 20 日平均换手率排名 / "
                          "dvol 近 20 日平均成交额最高 / dvolcv 近 20 日成交额变异系数最低 / "
                          "dvolcvh 近 20 日成交额变异系数最高 / "
                          "cvdown 按板块 RSRS 顺序逐个找「变异系数前 N 且满足均线排列」的个股 / "
                          "turnma 同上但按换手率降序找（换手率最大 + 均线排列）")
     ap.add_argument("--cvdown-top", type=int, default=3, help="--pick cvdown 时每个板块看 CV 前几名")
     ap.add_argument("--cvdown-sectors", type=int, default=3, help="--pick cvdown 时最多下探几个板块")
-    ap.add_argument("--turn-shares", default="pit",
-                    choices=["pit", "float", "wsflt", "ws", "snapshot"],
-                    help="换手率口径：pit = SEC 申报总股本 point-in-time（默认）；"
-                         "wsflt = PIT 总股本 × westock float_shares（推荐，真流通股本）；"
-                         "float = 总股本 × SEC 年报自由流通比例；"
-                         "ws = 直接用 westock 日 K 换手率（美股为成交量/总股本，仅对照）；"
-                         "snapshot = 旧口径（当前快照市值/价格推算，含前视）")
+    ap.add_argument("--turn-shares", default="ws",
+                    choices=["ws", "snapshot"],
+                    help="换手率口径：ws = 直接用 westock 日 K 换手率（美股为成交量/总股本，默认，"
+                         "定稿口径）；snapshot = 旧口径（当前快照市值/价格推算股本，含前视，仅对照）")
     ap.add_argument("--turn-noise", type=float, default=0.0,
                     help="给换手率注入对数正态噪声的标准差（0 = 不扰动），用于稳健性检验")
     ap.add_argument("--seed", type=int, default=0, help="--turn-noise 的随机种子")
@@ -477,33 +433,12 @@ def main() -> int:
                              .div(shares[cols], axis=1).reindex(cal).ffill())
                 print(f"换手率面板完成 {turn_rate.shape}（旧口径：股本由当前市值/价格推算，"
                       f"共 {len(cols)} 只）")
-            elif args.turn_shares == "wsflt":
-                # 真·流通股本：point-in-time 总股本 × 腾讯自选股的当日 float_shares/total_shares。
-                # 快照按年取（4 个时点），只用已发生的快照 ffill，不含前视。
-                from scripts.build_shares_outstanding import daily_shares
-                path = ROOT / "data" / "curated" / "fundamentals" / "float_ratio_ws.parquet"
-                if not path.exists():
-                    raise SystemExit(f"流通比例表不存在，先跑 scripts.build_float_ratio_ws：{path}")
-                fw = pd.read_parquet(path)
-                rp = fw.pivot(index="date", columns="symbol", values="ratio").sort_index()
-                cols = [c for c in stocks if c in vol.columns and c in rp.columns]
-                # bfill 只作用于「首个快照之前」的预热段（回测信号日都晚于首个快照）
-                ratio = rp[cols].reindex(cal).ffill().bfill()
-                sh_panel = daily_shares(cols, cal).mul(ratio, axis=1)
-                missing = sorted(set(stocks) - set(cols))
-                turn_rate = (vol[cols].rolling(20, min_periods=10).mean()
-                             .div(sh_panel, axis=1).reindex(cal).ffill())
-                print(f"换手率面板完成 {turn_rate.shape}（流通股本口径：PIT 总股本 × "
-                      f"westock float_shares/total_shares，共 {len(cols)} 只；无数据 {len(missing)} 只）")
-                if missing:
-                    print(f"  无流通股本数据已剔除：{' '.join(missing[:20])}"
-                          f"{' ...' if len(missing) > 20 else ''}")
-            elif args.turn_shares == "ws":
+            else:
                 # 数据源口径：腾讯自选股日 K 的换手率字段。注意它对美股是「成交量/总股本」
                 # 口径（实测 WMT/COIN/RDDT 全部对得上总股本），保留作对照，不是流通股本。
                 path = ROOT / "data" / "curated" / "fundamentals" / "turnover_daily.parquet"
                 if not path.exists():
-                    raise SystemExit(f"换手率面板不存在，先跑 scripts.build_turnover_ws：{path}")
+                    raise SystemExit(f"换手率面板不存在（应由 data 分支提供）：{path}")
                 tv = pd.read_parquet(path)
                 panel = tv.pivot(index="date", columns="symbol", values="turnover").sort_index()
                 cols = [c for c in stocks if c in panel.columns]
@@ -523,26 +458,6 @@ def main() -> int:
                       f"美股为成交量/总股本，20 日均值，共 {len(cols)} 只；无数据 {len(missing)} 只）")
                 if missing:
                     print(f"  无换手率数据已剔除：{' '.join(missing[:20])}"
-                          f"{' ...' if len(missing) > 20 else ''}")
-            else:
-                # 真实口径：SEC 申报股本（只用 filed ≤ 该日的记录），并折算到今天股本基准，
-                # 与本地按拆股复权后的成交量一致。float 再乘上年报披露的自由流通比例。
-                from scripts.build_shares_outstanding import daily_float_shares, daily_shares
-                cols = [c for c in stocks if c in vol.columns]
-                if args.turn_shares == "float":
-                    sh_panel = daily_float_shares(cols, cal)
-                    tag = "流通股本 = 申报总股本 × SEC 年报自由流通比例"
-                else:
-                    sh_panel = daily_shares(cols, cal)
-                    tag = "SEC 申报总股本 point-in-time"
-                cols = [c for c in cols if c in sh_panel.columns]
-                missing = sorted(set(stocks) - set(cols))
-                turn_rate = (vol[cols].rolling(20, min_periods=10).mean()
-                             .div(sh_panel[cols], axis=1).reindex(cal).ffill())
-                print(f"换手率面板完成 {turn_rate.shape}（{tag}，"
-                      f"共 {len(cols)} 只；无股本数据 {len(missing)} 只）")
-                if missing:
-                    print(f"  无股本数据已剔除：{' '.join(missing[:20])}"
                           f"{' ...' if len(missing) > 20 else ''}")
             if args.turn_cap > 0:
                 # 20 日均换手率超过上限的票，当期直接不参与排序（分母异常 / 极端事件）。
@@ -574,10 +489,6 @@ def main() -> int:
                 print(f"成交额变异系数面板完成 {dvol_cv.shape}"
                       f"（20 日 std/mean，volume × adj_close，窗口滞后 {args.cv_lag} 个交易日，"
                       f"共 {len(cols)} 只）")
-
-    rev_look = load_revenue() if args.pick == "rev" else None
-    if rev_look is not None:
-        print(f"营收面板 {len(rev_look)} 只（SEC companyconcept，按 filed ≤ 信号日过滤）")
 
     # 下跌趋势判定（cvdown 用）：收盘价低于 N 日均线，且均线本身在 M 个交易日内下行。
     # 只用信号日及之前的数据，不含未来。
@@ -732,10 +643,6 @@ def main() -> int:
                             break
                     if pick:
                         break
-        elif args.pick == "rev":
-            grow = {s: rev_cagr(rev_look, s, sig) for s in pool}
-            grow = {k: v for k, v in grow.items() if np.isfinite(v)}
-            pick = max(grow, key=grow.get) if grow else ""
         else:
             pick = str(ss.index[0]) if len(ss) else ""
 
@@ -815,8 +722,7 @@ def main() -> int:
         if args.trend_mode == "ma_stack":
             ptag += f"_{args.stack_order}"
     if args.pick in ("turn", "turnma"):
-        ptag += {"pit": "_snpit", "float": "_shflt", "wsflt": "_wsflt",
-                 "ws": "_turnws", "snapshot": "_shsnap"}[args.turn_shares]
+        ptag += {"ws": "_turnws", "snapshot": "_shsnap"}[args.turn_shares]
     if args.turn_cap > 0:
         ptag += f"_cap{round(args.turn_cap * 100)}"
     if args.turn_tail > 0:

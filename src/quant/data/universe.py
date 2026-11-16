@@ -232,7 +232,7 @@ def build(top_n: int | None = None, force: bool = False) -> pd.DataFrame:
 def load_latest() -> pd.DataFrame:
     path = latest_file()
     if not path.exists():
-        raise FileNotFoundError("股票池尚未构建，先跑 python -m scripts.build_universe")
+        raise FileNotFoundError("全市场快照尚未构建（应由 data job 的 paper_close_update 生成）")
     return pd.read_parquet(path)
 
 

@@ -173,6 +173,9 @@ def cmd_why(symbol: str, day: str | None) -> int:
         print(f"快照：{p.relative_to(state_dir()).as_posix()}")
         to = f"{float(r['turnover20']):.2%}" if pd.notna(r["turnover20"]) else "无"
         cap = f"{float(r['mcap']) / 1e8:.0f} 亿美元" if pd.notna(r["mcap"]) else "未知"
+        src = str(r.get("mcap_src") or "")
+        if cap != "未知" and src:
+            cap += f"（来源 {src}）"
         rank = f"{int(r['sector_rank'])}" if pd.notna(r["sector_rank"]) else "-"
         print(f"  {sym}  板块={r['sector']}  价={r['price']}  20日均换手={to}  市值={cap}")
         print(f"  均线 MA10/20/50 = {r['ma10']:.2f} / {r['ma20']:.2f} / {r['ma50']:.2f}"
@@ -276,7 +279,9 @@ def cmd_replay(day: str | None) -> int:
         quotes = _quotes_from_csv(qf)
         print(f"回放 {p.name}：报价 {len(quotes)} 只，asof {asof.date()} ……")
         try:
-            sig = signal_mod.compute(asof, quotes)
+            # 允许用今天的全市场快照取股本：快照是逐日覆盖的，历史那天的已经没留档；
+            # 用今天这份比退回到换手率反推更接近当时的真实股本（已知偏差，不算口径漂移）
+            sig = signal_mod.compute(asof, quotes, allow_snapshot_ahead=True)
         except SystemExit as exc:
             print(f"  ✗ 重算失败：{exc}")
             bad += 1

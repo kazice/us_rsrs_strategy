@@ -147,7 +147,7 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 | 换手率数据源 | westock 日 K（成交量/总股本） | 腾讯报价换手率字段 | 同源同口径；新浪按「成交量/市值反推股本」做校验与兜底 |
 | 成分股 | 2026-11-11 静态快照（492 只有行情） | 每日刷新 + 变更日志，代码归一 | live 比回测多 `BRK-B`/`BF-B`，两边口径不同，不可直接对曲线 |
 | 止损 | 不设 | 不设 | 单票满仓，回测最大回撤 −37.2% |
-| 市值门槛 | ≥500 亿美元，市值 = 未复权价 × 反推股本 | 同一套算法（`quant.live.mcap`） | 股本窗口不同：回测用全样本中位数（含前视），实盘只能用截至当日 → 约 0.95% 的「票·期」判定翻转，全是 500 亿附近的边缘票；36 期实际持仓不受影响 |
+| 市值门槛 | ≥500 亿美元，市值 = 未复权价 × 反推股本（全样本中位数） | 同一阈值，市值 = 未复权价 × **当日真实股本**（快照 → 反推 20 日 → SEC 三级兜底，逐票留来源） | 实盘不再用 3 年中位数（它会把拆股/回购后的股本算错）。503 只实测 500 亿门槛附近 **14 只**判定翻转；引用历史收益时要说明 |
 
 ## 七、已知风险（不是 bug，是取舍）
 
@@ -170,7 +170,7 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 | `src/quant/live/turnover.py` | 历史 19 天（ws 面板）+ 当天（报价）合成 20 日均换手率 |
 | `src/quant/live/pool.py` | 候选池：成分股快照刷新、调入调出变更日志、代码归一、新票识别 |
 | `src/quant/live/signal.py` | 当期信号：板块 RSRS → 市值/换手率过滤 → 换手率 top3 → 多头排列 → 下探 |
-| `src/quant/live/mcap.py` | 市值门槛：未复权价 × 反推股本，与回测 `--min-mcap` 同口径 |
+| `src/quant/live/mcap.py` | 市值门槛：未复权价 × 当日真实股本（Nasdaq 日快照 → 20 日换手率反推 → SEC 申报兜底） |
 | `src/quant/live/journal.py` | 运行流水与决策快照（用法见 `docs/LIVE_LOG.md`） |
 | `src/quant/live/books.py` | 持仓、流水、已推送标记（幂等） |
 | `src/quant/live/notify.py` | pushplus 推送 |

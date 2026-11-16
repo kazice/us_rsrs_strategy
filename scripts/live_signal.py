@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 LAG_WARN_MIN = 10.0        # 报价滞后超过这个数就在推送里明确标注
 LAG_REFUSE_MIN = 45.0      # 滞后到这个程度已不能代表 15:30，拒绝出信号
+DATA_LAG_ABORT_TD = 2      # 行情面板缺到 2 个交易日就中止（缺 1 天只告警）
+MARK_OK, MARK_NO = "\u2713", "\u2717"
 
 
 def _now(args) -> dt.datetime:
@@ -188,9 +190,10 @@ def _screen_lines(sig, decided: bool = False) -> list[str]:
         out += ["", "| 板块序 | 板块 | 代码 | 20日均换手 | MA10 | MA20 | MA50 | 多头排列 |",
                 "|---|---|---|---|---|---|---|---|"]
         for c in sig.candidates[:9]:
+            mark = MARK_OK if c.ok else MARK_NO
             out.append(f"| {c.sector_rank} | {c.sector} | {c.symbol} | {c.turnover:.2%} | "
                        f"{_ma_txt(c.ma, 10)} | {_ma_txt(c.ma, 20)} | {_ma_txt(c.ma, 50)} | "
-                       f"{'\u2713' if c.ok else '\u2717'} |")
+                       f"{mark} |")
 
     tbl = sig.pool_table
     if len(tbl):
@@ -322,8 +325,24 @@ def _run(args, j, now, today_et, occ, kind) -> int:
             return j.finish(2, "abort", f"stale_quotes_{lag_min:.0f}min")
 
     # --- 信号 ---
-    sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes)
+    try:
+        sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes)
+    except SystemExit as exc:      # 报价还是上一交易日的快照、行情历史不够等硬性条件
+        print(f"::error::{exc}")
+        return j.finish(2, "abort", "compute_abort")
     j.pick, j.sector = sig.pick, sig.sector
+
+    # 行情新鲜度：报价是实时的，但 bars 面板可能停在几天前（data job 挂了）。
+    # 那种情况下 RSRS/均线用的是旧收盘，推送里必须看得见；缺得多就直接中止。
+    lag_td = int(sig.data_lag_days or 0)
+    if lag_td:
+        last = f"{sig.data_last_bar:%Y-%m-%d}" if sig.data_last_bar is not None else "?"
+        line = f"行情面板最新 {last}，落后信号日 {lag_td} 个交易日"
+        if lag_td >= DATA_LAG_ABORT_TD and not args.now:
+            print(f"::error::{line}（阈值 {DATA_LAG_ABORT_TD}），数据链路已断，中止且不推送")
+            return j.finish(2, "abort", f"stale_data_{lag_td}td")
+        # 不到中止阈值就只告警：这句同时会进推送正文（signal 已把它写进 notes）
+        print(f"::warning::{line}（阈值 {DATA_LAG_ABORT_TD}），RSRS/均线用的是旧收盘")
 
     pos = books.load_position()
     holding_ret = books.mark_to_market(pos, quote_map, sig.factors)

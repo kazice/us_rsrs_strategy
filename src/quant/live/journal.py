@@ -144,6 +144,12 @@ class Journal:
         if ts:
             ref = self.t0.astimezone(cal_mod.ET)
             lag = round(sorted((ref - t).total_seconds() / 60.0 for t in ts)[len(ts) // 2], 1)
+        tbl = getattr(sig, "pool_table", None)
+        mcap_src: dict[str, int] = {}
+        if tbl is not None and len(tbl) and "mcap_src" in tbl.columns:
+            mcap_src = {str(k): int(v) for k, v in
+                        tbl["mcap_src"].fillna("").replace("", "missing").value_counts().items()}
+        last_bar = getattr(sig, "data_last_bar", None)
         meta = {
             "run_id": self.run_id,
             "ts_utc": self.t0.isoformat(timespec="seconds"),
@@ -154,6 +160,9 @@ class Journal:
             "git_sha": self.sha,
             "pool": {"size": sig.pool_size, "as_of": sig.pool_as_of},
             "quotes": {"count": len(quotes), "lag_min": lag},
+            "data": {"lag_days": int(getattr(sig, "data_lag_days", 0) or 0),
+                     "last_bar": str(last_bar.date()) if last_bar is not None else None},
+            "mcap": {"sources": mcap_src},
             "params": {
                 "rsrs_n": signal_mod.RSRS_N, "rsrs_m": signal_mod.RSRS_M,
                 "stack": list(signal_mod.STACK), "turn_cap": signal_mod.TURN_CAP,

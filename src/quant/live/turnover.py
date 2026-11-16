@@ -50,7 +50,7 @@ def load_history(symbols: list[str], asof: pd.Timestamp,
     """取 asof 之前（不含）的最近 lookback-1 个交易日的换手率，index=date、columns=symbol。"""
     path = turnover_path()
     if not path.exists():
-        raise SystemExit(f"换手率面板不存在：{path}（先跑 scripts.build_turnover_ws）")
+        raise SystemExit(f"换手率面板不存在：{path}（应由 data 分支提供，见 docs/HANDOFF.md 第 5 节）")
     tv = pd.read_parquet(path)
     tv = tv[tv["symbol"].isin(symbols)]
     panel = (tv.pivot(index="date", columns="symbol", values="turnover")
