@@ -135,8 +135,13 @@ jobs:
 
       - name: 生成数据说明（MANIFEST.md）
         # 每次更新数据后原地重写 MANIFEST.md，跟着数据一起提交到 data 分支
+        # always：行情更新失败时也要重写，保证 MANIFEST 描述的是盘上真实内容
+        if: always()
         run: python -m scripts.data_manifest
       - name: 回写 data 分支
+        # always：收盘更新失败时也要把已有数据和失败痕迹提交上去，
+        # 否则失败只留在 90 天后消失的 run log 里，事后查不到
+        if: always()
         run: |
           cd data
           git checkout -B data
