@@ -40,6 +40,8 @@ log = logging.getLogger(__name__)
 
 POOL_FILE = "us_sector_holdings.csv"
 CHANGES_FILE = "index_changes.csv"
+CHANGES_MD = "INDEX_CHANGES.md"          # 同一份变更历史的可读版，给人看
+_LABEL = {"add": "纳入", "delete": "调出", "move": "换板块"}
 CHANGE_COLUMNS = ["date", "action", "symbol", "sector_etf", "sector_name", "note"]
 
 
@@ -110,6 +112,48 @@ def recent_changes(days: int = 45, today: dt.date | None = None) -> pd.DataFrame
     today = today or dt.date.today()
     cutoff = pd.Timestamp(today - dt.timedelta(days=days))
     return df[df["date"] >= cutoff].sort_values(["date", "action"], ascending=[False, True])
+
+
+def render_changes_md(snapshot: pd.DataFrame | None = None) -> str:
+    """把 index_changes.csv 渲染成人看的 Markdown。
+
+    为什么还要 md：csv 是给代码追加的，人是按「上个月调进来哪几只」来回忆的，
+    直接用 csv 在 GitHub 上看是一堆重复的 date/action 行。同一份数据两种视图，
+    每次刷新成功就整体重写，保证不会出现「md 和 csv 各说一套」。
+    """
+    df = read_changes()
+    out = ["# 候选池调入调出历史", ""]
+    out.append("> 由 `quant.live.pool.refresh()` 在每次成功刷新 SSGA holdings 后重新生成，")
+    out.append("> 数据源是同目录的 `index_changes.csv`。**不要手工编辑**，改了下次会被覆盖。")
+
+    if snapshot is not None and len(snapshot):
+        as_of = ""
+        if "as_of" in snapshot.columns and snapshot["as_of"].notna().any():
+            as_of = str(snapshot["as_of"].dropna().iloc[0])
+        out += ["", f"> 当前快照：`us_sector_holdings.csv`，as of {as_of or '未知'}，"
+                    f"{len(snapshot)} 只"]
+
+    out += ["", "## 汇总", "", "| 动作 | 次数 |", "|---|---|"]
+    for key, label in _LABEL.items():
+        out.append(f"| {label} | {int((df['action'] == key).sum())} |")
+
+    out += ["", "## 明细", ""]
+    if df.empty:
+        out.append("_还没有记录到任何调入调出。_")
+    else:
+        out += ["| 日期 | 动作 | 代码 | 板块 ETF | 板块名 | 备注 |", "|---|---|---|---|---|---|"]
+        for r in df.sort_values(["date", "action"], ascending=[False, True]).itertuples():
+            day = "" if pd.isna(r.date) else pd.Timestamp(r.date).strftime("%Y-%m-%d")
+            out.append(f"| {day} | {_LABEL.get(r.action, r.action)} | {r.symbol} | "
+                       f"{r.sector_etf} | {r.sector_name} | {r.note} |")
+    return "\n".join(out) + "\n"
+
+
+def write_changes_md(snapshot: pd.DataFrame | None = None) -> Path:
+    path = data_ref_dir() / CHANGES_MD
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_changes_md(snapshot), encoding="utf-8")
+    return path
 
 
 def _append_changes(rows: list[dict]) -> None:
@@ -221,6 +265,10 @@ def refresh(today: dt.date | None = None, dry_run: bool = False) -> RefreshResul
                      "sector_etf": sec_of.get(s, ""), "sector_name": name_of.get(s, ""),
                      "note": "板块归属变更"})
     _append_changes(rows)
+    try:
+        write_changes_md(new)
+    except Exception:                               # noqa: BLE001  可读版写不出来不该影响刷新
+        log.warning("写 %s 失败（csv 已落盘，历史没丢）", CHANGES_MD)
 
     msg = (f"快照 as of {as_of}，{len(new)} 只；新增 {len(added)}、剔除 {len(removed)}、"
            f"换板块 {len(moved)}；本地无行情需补 {len(new_symbols)}")
