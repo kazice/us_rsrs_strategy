@@ -87,11 +87,16 @@ class YahooSource:
         if not symbols:
             return {}
 
+        # Yahoo 只认连字符：BRK.B / BF.B 要查成 BRK-B / BF-B，用点号会静默返回空，
+        # 这两只就永远补不上行情。这里只转「查询名」，落盘仍按原始代码
+        # （store.bars_file 用的是 holdings 里的写法，目录名不能跟着变）。
+        query = {sym: sym.replace(".", "-") for sym in symbols}
+
         start_ts = pd.Timestamp(start).normalize()
         end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)  # yfinance end 为开区间
 
         raw = yf.download(
-            tickers=symbols,
+            tickers=sorted(set(query.values())),
             start=start_ts.date().isoformat(),
             end=end_ts.date().isoformat(),
             interval="1d",
@@ -104,7 +109,7 @@ class YahooSource:
 
         out: dict[str, pd.DataFrame] = {}
         for sym in symbols:
-            df = _extract(raw, sym)
+            df = _extract(raw, query[sym])
             if not df.empty:
                 out[sym] = df
         return out
