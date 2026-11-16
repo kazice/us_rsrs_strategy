@@ -28,6 +28,9 @@ on:
         type: choice
         options: [auto, rebalance, week]
         default: auto
+      now:
+        description: '复现时刻（如 2026-11-13 15:30，缺省时区按 ET；留空=系统时钟）'
+        default: ''
       force:
         description: '无视执行窗口与幂等键（仅排错/验证用，会真的推送）'
         type: choice
@@ -82,6 +85,7 @@ jobs:
         run: |
           python -m scripts.live_signal \
             --kind "${{ github.event.inputs.kind || 'auto' }}" \
+            ${{ github.event.inputs.now != '' && format('--now "{0}"', github.event.inputs.now) || '' }} \
             ${{ github.event.inputs.force == 'true' && '--force' || '' }} \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} \
             2>&1 | tee "$RUNNER_TEMP/live_signal.log"
