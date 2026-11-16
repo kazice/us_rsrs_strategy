@@ -203,15 +203,16 @@ def _screen_lines(sig) -> list[str]:
         turn_ok = tbl["turn_ok"] == True                   # noqa: E712
         stack_ok = tbl["stack_ok"] == True                 # noqa: E712
         both = cap_ok & turn_ok
-        cap_txt = "市值不限" if not sig.min_mcap else f"过市值门槛 {int(cap_ok.sum())} 只"
         out.append("")
-        out.append(f"- 数量：候选池 {len(tbl)} 只 \u2192 {cap_txt} "
-                   f"\u2192 再过滤换手 {int(both.sum())} 只 "
+        out.append(f"- 数量：候选池 {len(tbl)} 只 \u2192 市值+换手双合规 {int(both.sum())} 只 "
                    f"\u2192 MA 多头排列 {int((both & stack_ok).sum())} 只 "
                    f"\u2192 进板块 TOP3 {int((tbl['in_top3'] == True).sum())} 只 "  # noqa: E712
                    f"\u2192 选中 {int((tbl['selected'] == True).sum())} 只")  # noqa: E712
-        out.append(f"- 参考：全池 MA 多头排列共 {int(stack_ok.sum())} 只"
+        out.append(f"- 参考：全池 MA 多头排列 {int(stack_ok.sum())} 只"
                    f"（含未过市值/换手门槛的）")
+        out.append("- 口径：先按板块 RSRS 取前 3 个板块，"
+                   "每个板块内按 20 日均换手降序取前 3 只，"
+                   "只在这最多 9 只里判 MA10>MA20>MA50，命中即止")
     return out
 
 
