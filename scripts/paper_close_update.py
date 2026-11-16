@@ -39,6 +39,8 @@ log = logging.getLogger(__name__)
 
 TURNOVER_FILE = "curated/fundamentals/turnover_daily.parquet"
 SETTLE_MIN = 8
+FRESH_MIN_COVER = 0.95     # 成分股/换手率里「已更新到当日」的占比下限，低于此判本次运行失败
+FRESH_LOOKBACK_DAYS = 10   # 找「应有交易日」时最多往回翻几天
 
 
 def members() -> list[str]:
@@ -75,6 +77,69 @@ def append_turnover(day: dt.date, quote_map: dict[str, quotes.Quote]) -> int:
     log.info("换手率面板 %d 行、%d 只，最新 %s", len(merged),
              merged["symbol"].nunique(), f"{merged['date'].max():%Y-%m-%d}")
     return len(new)
+
+
+def expected_bar_date(day: dt.date) -> dt.date:
+    """收盘更新之后，日线里应该已经有的最后一个交易日。"""
+    d = day
+    for _ in range(FRESH_LOOKBACK_DAYS):
+        if calendar.is_trading_day(d):
+            return d
+        d -= dt.timedelta(days=1)
+    return day
+
+
+def check_freshness(day: dt.date, syms: list[str]) -> list[str]:
+    """自检：日线与换手率是否真的更新到了 ``day``。返回问题清单（空 = 通过）。
+
+    为什么必须自检：``fetch.update`` 对单只标的失败只记进 ``stats['failed']``，进程照样退 0；
+    yahoo 也可能对整个市场返回上一交易日的 bar（或被限流）。这两种情况下 Actions 都是绿的、
+    data 分支照常回写，直到下一个调仓日（最长 20 天后）才被 ``signal.data_lag_days`` 发现——
+    那时已经错过了修复窗口。所以这里按标的逐个核对"最后一天有没有 bar"，不达标就把运行标红。
+
+    只读，不改数据：即使自检失败，已抓到的部分仍然回写（半份数据比没有好），
+    但退出码为 1，GitHub Actions 会把这次运行标成失败。
+    """
+    problems: list[str] = []
+    want = expected_bar_date(day)
+    if want != day:
+        problems.append(f"{day} 不是交易日，按 {want} 核对")
+
+    etfs = list(SECTOR_ETFS) + [BENCH]
+    start = (want - dt.timedelta(days=FRESH_LOOKBACK_DAYS)).isoformat()
+    panel = store.load_panel(field="close", symbols=syms, start=start, end=want.isoformat())
+    stamp = pd.Timestamp(want)
+    if panel.empty or stamp not in panel.index:
+        last = f"{panel.index.max():%Y-%m-%d}" if len(panel) else "无"
+        problems.append(f"日线面板里没有 {want} 这一行（面板最新 {last}）")
+        have = pd.Series(dtype="bool")
+    else:
+        have = panel.loc[stamp].notna()
+
+    etf_stale = [s for s in etfs if not bool(have.get(s, False))]
+    if etf_stale:
+        # ETF 是板块层的全部输入，缺一只整张板块排序就不可信，必须严格
+        problems.append(f"板块 ETF 未更新到 {want}：{' '.join(etf_stale)}")
+
+    stocks = [s for s in syms if s not in set(etfs)]
+    cover = float(have.reindex(stocks).eq(True).mean()) if stocks else 1.0
+    if cover < FRESH_MIN_COVER:
+        stale = [s for s in stocks if not bool(have.get(s, False))]
+        problems.append(f"成分股只有 {cover:.1%} 更新到 {want}（下限 {FRESH_MIN_COVER:.0%}），"
+                        f"未更新 {len(stale)} 只：{' '.join(stale[:15])}"
+                        f"{' ...' if len(stale) > 15 else ''}")
+
+    path = store.data_root() / TURNOVER_FILE
+    if path.exists():
+        tv = pd.read_parquet(path)
+        if len(tv):
+            tv["date"] = pd.to_datetime(tv["date"])
+            got = set(tv.loc[tv["date"] == stamp, "symbol"]) & set(syms)
+            tv_cover = len(got) / len(syms) if syms else 1.0
+            if tv_cover < FRESH_MIN_COVER:
+                problems.append(f"换手率只有 {tv_cover:.1%} 的标的写到 {want}"
+                                f"（面板最新 {tv['date'].max():%Y-%m-%d}）")
+    return problems
 
 
 def main() -> int:
@@ -171,6 +236,17 @@ def main() -> int:
     print(f"换手率：写入 {n} 行（{day}）")
     if notes:
         print(f"  来源异常 {len(notes)} 只：{list(notes)[:8]}")
+
+    # --- 4. 自检：数据是不是真的更新到了今天 ---
+    # 这一步是给「静默失败」兜底的：抓取环节失败不会中断进程，只有这里会把运行标红。
+    problems = check_freshness(day, syms)
+    if problems:
+        for p in problems:
+            print(f"::error::{p}")
+        print(f"::error::数据完整性自检未通过（{len(problems)} 项）：已抓到的部分照常回写，"
+              f"但请**当天**补齐，别等下一个调仓日才发现（迟了最长 20 天）")
+        return 1
+    print(f"自检通过：日线与换手率均已覆盖 {expected_bar_date(day)}")
     return 0
 
 

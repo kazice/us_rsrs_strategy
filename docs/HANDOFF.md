@@ -171,7 +171,7 @@ journal.finish(0, "ok", detail)  # 写一行流水
 |---|---|---|---|
 | `scripts/live_signal.py` | 信号 job 入口：判日、拉报价、算信号、渲染、快照、推送、记账 | `main` / `_run` / `render_rebalance` / `render_week` / `_pool_context` | CI 直接调用 |
 | `scripts/live_audit.py` | 日志查询：`--list/--date/--why/--runs/--gaps/--replay/--stats` | `cmd_date` / `cmd_why` / `cmd_gaps` / `cmd_replay` | 人工、CI 可选 |
-| `scripts/paper_close_update.py` | 收盘后更新：成分股刷新、新票补行情、日线增量、写当日换手率 | `main` / `append_turnover` / `members` | CI 的 data job |
+| `scripts/paper_close_update.py` | 收盘后更新：成分股刷新、新票补行情、日线增量、写当日换手率、**跑完自检** | `main` / `append_turnover` / `check_freshness` / `members` | CI 的 data job；自检不过就返回 1（Actions 标红），数据仍回写 |
 
 ### 3.2 模拟盘本体 `src/quant/live/`
 
@@ -316,7 +316,7 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 | 11 | 复制出去的 `.py` 是乱码 | 公司加密软件按扩展名加密 | 改成 `.txt` 再复制（见第 0 节） |
 | 12 | 早收日（感恩节次日/7-3/平安夜）错过窗口 | 时钟没按当日实际收盘算 | 一律走 `calendar.session_close_et`，不要写死 16:00 ET |
 | 13 | 市值突然整批变了 | 快照 `asof` 是抓取日（容器 UTC+8），比 ET 交易日早 1 天；或快照没刷新 | 看推送里的「市值来源：快照 N / 反推 N（快照 as of …）」；`asof` 超前 >2 天会被判为未来快照而弃用 |
-| 14 | 信号用的是几天前的收盘 | data job 挂了，bars 面板没更新，而报价是实时的 | `Signal.data_lag_days` 会随推送露出；缺 2 个交易日以上直接 abort（`DATA_LAG_ABORT_TD`），缺 1 天只告警 |
+| 14 | 信号用的是几天前的收盘 | data job 挂了，bars 面板没更新，而报价是实时的 | 两道：①data job 末尾 `check_freshness` 自检（ETF 必须 100%、成分股/换手率 ≥95% 有当日数据，否则运行返回 1 标红）；②信号层 `trading_lag_days` 兜底（缺 1 天告警、≥2 天中止） |
 | 15 | 选出一只完全不相干的票 | 把一份**不属于信号日**的报价当成当日 bar 追加：面板尾部多一根"昨天的复制品"或一个"零区间点"，RSRS 的 R² 被拉向 1、β 变形，板块排序整体改写（实测 11-13 的 XLP 1.06 会被算成 0.44，MNST 变 APP） | `_append_live_row` 三级降级：①日线已有当日 bar → 用日线；②没有但有当日盘中报价（`Quote.ts` 的 ET 日期 == 信号日 且 ≥50% 带 high>low）→ 用报价合成；③都没有 → **退回最近一根真实日线**，口径日随之改成那天并写进推送 |
 
 ---
@@ -336,7 +336,7 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 |---|---|
 | 模拟盘尚未真实跑过 | `state/live` 下没有账本，首期建仓等 2026-11-30 |
 | 回测的股本估计含前视 | 实盘已改（市值改用当日真实股本），回测未改；要对齐需把回测 `--min-mcap` 的股本换成同一套后重跑五档。现状是两边在门槛附近 14 只票上判定不同 |
-| data job 断档会静默用旧收盘 | 已修：`signal.trading_lag_days` 数缺口，缺 1 天告警、缺 ≥2 天中止（`live_signal.DATA_LAG_ABORT_TD`） |
+| data job 断档会静默用旧收盘 | 已修：data job 跑完自检 `check_freshness`（ETF 严格、成分股与换手率 ≥95%），不达标返回 1 让 Actions 当天变红；信号层 `trading_lag_days` 再兜一层（缺 ≥2 天中止） |
 | 报价不属于信号日时会造出一根假 bar | 已修：`_append_live_row` 三级降级（日线 → 当日盘中报价 → 退回最近日线），口径日一律跟着数据走；`Signal.asof` 是实际口径日、`requested_asof` 是请求日。调仓日若口径日 ≠ 请求日则中止（不按旧口径下单记账），周报只告警 |
 | 收益高度集中 | 2024-11 APP 单独占 29% 对数收益，前 3 期占 61%。这不是 bug，但任何"提升稳定性"的改造都要先量化它对这几期的影响 |
 | `--gaps` 只查月频调仓 | 周报不查（漏发影响小） |

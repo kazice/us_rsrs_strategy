@@ -30,7 +30,7 @@ docs/PAPER_TRADING.md               模拟盘：链路、候选池、与回测�
 docs/LIVE_LOG.md                    日志与回溯：目录、字段、查询命令、注意事项
 scripts/live_signal.py              信号入口（含日志落盘）
 scripts/live_audit.py               日志查询工具
-scripts/paper_close_update.py       收盘后更新行情 / 换手率 / 成分股
+scripts/paper_close_update.py       收盘后更新行情 / 换手率 / 成分股（末尾做完整性自检）
 src/quant/live/                     模拟盘本体（calendar/quotes/turnover/pool/signal/mcap/books/notify/journal）
 src/quant/data/                     行情层（store/fetch/universe/sources）
 ```
