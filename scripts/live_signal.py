@@ -127,24 +127,13 @@ def render_rebalance(sig, action: str, action_detail: str, pos: books.Position,
         f"**动作**：{action} —— {action_detail}",
         f"**板块**：{sig.sector}（RSRS {sig.sector_scores.get(sig.sector, float('nan')):.2f}）",
     ]
-    if sig.pick:
-        lines.append(f"**买入参考价**：${sig.price:.2f}（收盘前 30 分钟时点价，不是收盘价）")
-    else:
-        lines.append("**本期空仓**：3 个板块 × 换手率前 3 名里没有满足多头排列的标的。")
-
     if not pos.is_empty():
         lines.append(f"**上期持仓**：{pos.symbol}（{pos.sector}，{pos.entry_date} 建仓 "
                      f"@ ${pos.entry_price:.2f}），持有期收益 {_fmt_pct(holding_ret)}")
 
-    top = signal_mod.top_sectors(sig)
-    lines += ["", "**板块 RSRS 前三**：" + " / ".join(f"{s} {v:.2f}" for s, v in top)]
-
-    if sig.candidates:
-        lines += ["", "| 板块序 | 板块 | 代码 | 20日均换手 | 多头排列 |",
-                  "|---|---|---|---|---|"]
-        for c in sig.candidates[:9]:
-            lines.append(f"| {c.sector_rank} | {c.sector} | {c.symbol} | "
-                         f"{c.turnover:.2%} | {'✓' if c.ok else '✗'} |")
+    # 与周报共用同一段「本期筛选」：板块 RSRS 前三、换手 TOP3 的 MA10/20/50、各层数量。
+    # 调仓那天才是真成交，看不到均线具体值说不过去。
+    lines += _screen_lines(sig, decided=True)
 
     lines += _pool_lines(pctx)
 
@@ -169,22 +158,28 @@ def _ma_txt(mas: dict, w: int) -> str:
     return "—" if v is None or v != v else f"{v:.2f}"
 
 
-def _screen_lines(sig) -> list[str]:
+def _screen_lines(sig, decided: bool = False) -> list[str]:
     """本期筛选明细：结论 + 板块 RSRS + 换手 TOP3 的均线 + 各层数量。
 
     周报原先只报持仓，空仓时就两行，读的人分不清「没有合格标的」和「还没建仓」，
     也看不到候选究竟卡在哪一步。这里把每一步的具体数字摊开。
+
+    ``decided=True`` 用在调仓推送：那天是真的要下单，「若今日为调仓日」的假设语气
+    要换成「买入」；其余内容与周报完全一致，两种推送看同一张表。
     """
     out = ["", "**本期筛选**"]
 
     if sig.pick:
         rank = next((c.sector_rank for c in sig.candidates if c.symbol == sig.pick), 1)
         rsrs = float(sig.sector_scores.get(sig.sector, float("nan")))
-        out.append(f"- 结论：**{sig.pick}**（{sig.sector}）满足全部条件\u2014\u2014"
+        lead = "结论：买入" if decided else "结论：若当日为调仓日，买入"
+        out.append(f"- {lead} **{sig.pick}**（{sig.sector}）满足全部条件\u2014\u2014"
                    f"板块 RSRS 第 {rank}（{rsrs:.2f}），在换手 TOP3 内且 MA10>MA20>MA50；"
-                   f"参考价 ${sig.price:.2f}")
+                   f"参考价 ${sig.price:.2f}（盘中时点价，非收盘价）")
     else:
-        out.append("- 结论：前三个板块 \u00d7 换手 TOP3 全部不满足 MA10>MA20>MA50，本期无合格标的")
+        tail = "，本次调仓空仓" if decided else ""
+        out.append("- 结论：前三个板块 \u00d7 换手 TOP3 全部不满足 MA10>MA20>MA50，"
+                   f"本期无合格标的{tail}")
 
     top = signal_mod.top_sectors(sig)
     out.append("- 板块 RSRS 前三：" + " / ".join(f"{s} {v:.2f}" for s, v in top))
