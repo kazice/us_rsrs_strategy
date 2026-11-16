@@ -228,7 +228,7 @@ def _run(args, j, now, today_et, occ, kind) -> int:
     """主流程。每个出口都走 ``j.finish``，保证「没发信号」也能被事后查到原因。"""
     print(f"现在：{now.isoformat(timespec='seconds')} = "
           f"{now.astimezone(calendar.ET):%Y-%m-%d %H:%M} ET（{today_et}）")
-    print(f"日历：{occ.reason}；收盘 {occ.close_et}；触发 {occ.trigger_utc}")
+    print(f"日历：{occ.reason}；收盘 {occ.close_et}；触发 {occ.trigger_utc}；kind={occ.kind}")
 
     if not args.force:
         if kind == "none":
