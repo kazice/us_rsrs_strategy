@@ -28,6 +28,11 @@ on:
         type: choice
         options: [auto, rebalance, week]
         default: auto
+      force:
+        description: '无视执行窗口与幂等键（仅排错/验证用，会真的推送）'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
       dry_run:
         description: '只算不推（true/false）'
         default: 'false'
@@ -77,6 +82,7 @@ jobs:
         run: |
           python -m scripts.live_signal \
             --kind "${{ github.event.inputs.kind || 'auto' }}" \
+            ${{ github.event.inputs.force == 'true' && '--force' || '' }} \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} \
             2>&1 | tee "$RUNNER_TEMP/live_signal.log"
       - name: 上传运行日志（兜底，14 天）
