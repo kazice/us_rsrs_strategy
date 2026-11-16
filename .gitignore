@@ -1,0 +1,17 @@
+# 行情与日志都在独立的 data 分支，不进主仓
+data/
+reports/
+logs/
+state/
+
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 密钥
+.env
+.env.*
