@@ -234,6 +234,8 @@ def render_week(sig, pos: books.Position, holding_ret: float | None, ctx: dict,
         ]
     body += _screen_lines(sig)
     body += _pool_lines(pctx)
+    if ctx.get("warnings"):
+        body += [""] + [f"- ⚠ {w}" for w in ctx["warnings"]]
     body += ["", "---", f"报价滞后 {ctx['lag']}；换手率覆盖 {ctx['turn_cov']}。"]
     return title, "\n".join(body)
 
@@ -331,6 +333,17 @@ def _run(args, j, now, today_et, occ, kind) -> int:
         print(f"::error::{exc}")
         return j.finish(2, "abort", "compute_abort")
     j.pick, j.sector = sig.pick, sig.sector
+
+    # 口径日与请求日不一致：当日数据还没到（周末/盘前/数据源没翻页），signal 已退回最近一根
+    # 真实日线。周报照发（只是看板），但**调仓日**不能按旧口径下单，否则账本会记进一笔
+    # 根本没在当天决策过的交易。
+    if pd.Timestamp(sig.asof).date() != pd.Timestamp(today_et).date():
+        if kind == "rebalance" and not args.now:
+            print(f"::error::调仓日 {today_et} 拿不到当日行情（口径退到 {sig.asof:%Y-%m-%d}），"
+                  f"不按旧口径下单调仓，中止且不推送")
+            return j.finish(2, "abort", f"fallback_{sig.asof:%Y%m%d}")
+        warnings.append(f"本信号按 {sig.asof:%Y-%m-%d} 的口径计算（请求 {today_et}，"
+                        f"当日数据未到），不能当作 {today_et} 的调仓依据")
 
     # 行情新鲜度：报价是实时的，但 bars 面板可能停在几天前（data job 挂了）。
     # 那种情况下 RSRS/均线用的是旧收盘，推送里必须看得见；缺得多就直接中止。

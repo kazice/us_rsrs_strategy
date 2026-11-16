@@ -116,6 +116,7 @@ class Signal:
     min_mcap: float = 0.0          # 候选池市值门槛（美元），0 = 不限
     data_lag_days: int = 0         # 行情面板落后信号日几个交易日（0 = 到上一交易日，正常）
     data_last_bar: pd.Timestamp | None = None
+    requested_asof: pd.Timestamp | None = None   # 调用方请求的日期；asof 是实际口径日
     pool_table: pd.DataFrame = field(default_factory=pd.DataFrame)   # 全池候选表，供日志落盘
 
     @property
@@ -153,68 +154,53 @@ def _quote_range_cover(quotes: dict[str, Quote]) -> tuple[float, int]:
 
 def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
                      quotes: dict[str, Quote], asof: pd.Timestamp,
-                     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float], str]:
-    """把信号日那根 bar 补齐到面板尾部，返回 (px, hi, lo, 复权因子, 该 bar 的来源)。
+                     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float], str, pd.Timestamp]:
+    """把信号日那根 bar 补齐，返回 (px, hi, lo, 复权因子, 口径来源, 实际口径日)。
 
-    以日线实际数据为准，分两种情形：
+    以数据自身为准，三级降级，不猜、不中止：
 
-    - **日线里已经有这一天的 bar**（决策在收盘后跑，或历史时点复现）→ 直接用日线，
-      不拿报价去覆盖它。报价是盘中快照，覆盖过去等于把已确定的收盘数据改小。
-    - **日线只到前一交易日**（盘中 15:30 决策的正常情形）→ 用报价合成当日 bar，但前提是
-      报价确实属于信号日这个交易日。报价的交易日取自它自己的时间戳；对不上就说明数据源
-      还没翻页（拿到的是上一交易日的收盘快照），此时合成等于在面板尾部复制一根昨天的 bar，
-      20 日回归的 R² 会被拉向 1，板块排序整体改写（实测 11-13 的 XLP 1.06 会被算成 0.44，
-      选出的票从 MNST 变成 APP）。这种情形一律拒绝，不做相似度猜测。
+    1. ``daily``：日线里已经有请求日这根 bar（收盘后跑、或历史时点复现）→ 直接用日线。
+       报价是盘中快照，拿它覆盖已确定的收盘数据只会把 bar 改小。
+    2. ``quote``：日线只到前一交易日，且报价确实是请求日这个交易日的（取 ``Quote.ts`` 的
+       ET 日期），并且带真实日内区间（high > low，排除开盘前的 `high=low=昨收`）→ 用报价
+       合成当日 bar。这是盘中 15:30 决策的正常路径。
+    3. ``fallback``：请求日还没有任何当日数据（周末、盘前、数据源没翻页、请求的是未来日期）
+       → 退回**最近一根真实日线**，口径日改成那一天，并在推送里写明。宁可报旧口径的信号，
+       也不拿一份不属于当日的报价去造 bar——那会在面板尾部复制一根前值，20 日回归的 R² 被
+       拉向 1，板块排序整体改写（实测 11-13 的 XLP 1.06 会被算成 0.44，MNST 变 APP）。
 
     复权因子取最近一个交易日的 ``adj_close / close``：报价是未复权价，乘上它才和面板里的
     adj_close 同口径。除权当天因子会跳变，但一天之内不影响排序。
     """
-    last_bar = px.index.max() if len(px.index) else None
-    asof = pd.Timestamp(asof).normalize()
+    req = pd.Timestamp(asof).normalize()
+    last_bar = pd.Timestamp(px.index.max()).normalize() if len(px.index) else None
+    if last_bar is None:
+        raise SystemExit(f"{req} 之前没有历史行情，无法计算信号")
 
-    if last_bar is not None and pd.Timestamp(last_bar).normalize() >= asof:
-        # 日线已覆盖信号日：以实际日线为准
-        px = px[px.index <= asof].copy()
-        hi = hi[hi.index <= asof].copy()
-        lo = lo[lo.index <= asof].copy()
-        last_close = store.load_panel(field="close", symbols=list(px.columns),
-                                      start=str((asof - pd.Timedelta(days=20)).date()),
-                                      end=str(asof.date()))
-        factor = (px.iloc[-1] / last_close.iloc[-1]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        return px, hi, lo, {s: float(factor[s]) for s in factor.index}, "daily"
+    session = _quote_session(quotes)
+    range_cover, checked = _quote_range_cover(quotes)
 
-    px = px[px.index < asof].copy()
-    hi = hi[hi.index < asof].copy()
-    lo = lo[lo.index < asof].copy()
-    if px.empty:
-        raise SystemExit(f"{asof} 之前没有历史行情，无法计算信号")
+    if last_bar >= req:
+        eff, src = req, "daily"
+    elif (session == req.date()
+          and (checked < 20 or range_cover >= QUOTE_RANGE_MIN_COVER)):
+        eff, src = req, "quote"
+    else:
+        eff, src = last_bar, "fallback"
 
+    px = px[px.index <= eff].copy()
+    hi = hi[hi.index <= eff].copy()
+    lo = lo[lo.index <= eff].copy()
     last_close = store.load_panel(field="close", symbols=list(px.columns),
-                                  start=str((asof - pd.Timedelta(days=20)).date()),
-                                  end=str(asof.date()))
-    last_close = last_close[last_close.index < asof]
+                                  start=str((eff - pd.Timedelta(days=20)).date()),
+                                  end=str(eff.date())).ffill()
     if last_close.empty:
         raise SystemExit("取不到最近收盘价，无法计算复权因子")
     factor = (px.iloc[-1] / last_close.iloc[-1]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    factors = {s: float(factor[s]) for s in factor.index}
 
-    session = _quote_session(quotes)
-    if session is None:
-        raise SystemExit("报价没有时间戳，无法确认它属于哪个交易日，拒绝合成当日 bar")
-    if pd.Timestamp(session) != asof:
-        raise SystemExit(
-            f"报价的交易日是 {session}，信号日是 {asof:%Y-%m-%d}，日线最新 {px.index[-1]:%Y-%m-%d}："
-            f"信号日这根 bar 没有任何真实数据，用旧报价合成只会复制前一根、改写板块 RSRS。"
-            f"等数据源更新到 {asof:%Y-%m-%d} 再出信号"
-        )
-
-    range_cover, checked = _quote_range_cover(quotes)
-    if checked >= 20 and range_cover < QUOTE_RANGE_MIN_COVER:
-        raise SystemExit(
-            f"只有 {range_cover:.0%} 的报价（{checked} 只）带日内区间（high>low），其余是 "
-            f"high=low=收盘：{asof:%Y-%m-%d} 的当日 bar 还没形成（开盘前/集合竞价阶段，"
-            f"数据源会把 high/low 填成上一交易日收盘）。合成的 bar 是一个点，会让 RSRS 回归退化，"
-            f"拒绝出信号"
-        )
+    if src != "quote":
+        return px, hi, lo, factors, src, eff
 
     row_px, row_hi, row_lo = {}, {}, {}
     for s, q in quotes.items():
@@ -225,17 +211,17 @@ def _append_live_row(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
         row_hi[s] = max(q.high, q.price) * f
         row_lo[s] = min(q.low or q.price, q.price) * f
 
-    idx = px.index.append(pd.DatetimeIndex([asof]))
+    idx = px.index.append(pd.DatetimeIndex([eff]))
     px = px.reindex(idx).ffill()
     hi = hi.reindex(idx).ffill()
     lo = lo.reindex(idx).ffill()
     for s, v in row_px.items():
-        px.at[asof, s] = v
+        px.at[eff, s] = v
     for s, v in row_hi.items():
-        hi.at[asof, s] = v
+        hi.at[eff, s] = v
     for s, v in row_lo.items():
-        lo.at[asof, s] = v
-    return px, hi, lo, {s: float(factor[s]) for s in factor.index}, "quote"
+        lo.at[eff, s] = v
+    return px, hi, lo, factors, src, eff
 
 
 def _stack_ok(px: pd.DataFrame, asof: pd.Timestamp, sym: str) -> tuple[bool, dict[int, float]]:
@@ -278,10 +264,7 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
 
     notes: list[str] = []
     last_bar = px.index.max() if len(px.index) else None
-    lag_days = trading_lag_days(last_bar, asof)
-    if lag_days:
-        notes.append(f"⚠ 行情面板最新 {last_bar:%Y-%m-%d}，落后信号日 {lag_days} 个交易日："
-                     f"板块 RSRS 与均线用的是旧收盘，本期信号仅供参考")
+    requested_asof = asof
     stocks_missing: list[str] = []          # 有成分没本地行情，审计时要单独标出来
     missing = [s for s in syms if s not in px.columns]
     if missing:
@@ -303,9 +286,19 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
         notes.append(f"{len(no_quote)} 只无当日报价（今日 bar 用前值 ffill）："
                      f"{' '.join(no_quote[:10])}{' ...' if len(no_quote) > 10 else ''}")
 
-    px, hi, lo, factors, bar_src = _append_live_row(px, hi, lo, quotes, asof)
-    if bar_src == "daily":
-        notes.append(f"信号日 {asof:%Y-%m-%d} 已有实际日线，按日线口径计算（未用盘中报价覆盖）")
+    px, hi, lo, factors, bar_src, eff_asof = _append_live_row(px, hi, lo, quotes, asof)
+    if eff_asof != requested_asof:
+        notes.append(
+            f"请求日 {requested_asof:%Y-%m-%d} 还没有当日数据（日线最新 {last_bar:%Y-%m-%d}，"
+            f"报价交易日 {_quote_session(quotes)}）：本次按 {eff_asof:%Y-%m-%d} 的口径计算"
+        )
+    elif bar_src == "daily":
+        notes.append(f"信号日 {eff_asof:%Y-%m-%d} 已有实际日线，按日线口径计算（未用盘中报价覆盖）")
+    asof = eff_asof
+    lag_days = trading_lag_days(last_bar, asof)
+    if lag_days:
+        notes.append(f"⚠ 行情面板最新 {last_bar:%Y-%m-%d}，落后信号日 {lag_days} 个交易日："
+                     f"板块 RSRS 与均线用的是旧收盘，本期信号仅供参考")
 
     etf_rsrs = rsrs_panel_fast(hi[SECTOR_ETFS], lo[SECTOR_ETFS], RSRS_N, RSRS_M, "strict")
     if asof not in etf_rsrs.index or etf_rsrs.loc[asof].dropna().empty:
@@ -424,7 +417,8 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
                   pool_as_of=str(members["as_of"].dropna().iloc[0])
                   if "as_of" in members.columns and members["as_of"].notna().any() else "",
                   min_mcap=mcap_mod.MIN_MCAP, pool_table=pool_table,
-                  data_lag_days=lag_days, data_last_bar=last_bar)
+                  data_lag_days=lag_days, data_last_bar=last_bar,
+                  requested_asof=requested_asof)
 
 
 def top_sectors(signal: Signal, n: int = 3) -> list[tuple[str, float]]:
