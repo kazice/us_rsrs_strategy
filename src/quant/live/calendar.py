@@ -354,14 +354,16 @@ def occasion_for(d: dt.date) -> Occasion:
     # 月末最后交易日：下一个交易日的月份与今天不同
     nxt = next_trading_day(d)
     if nxt.month != d.month:
-        return Occasion("rebalance", d, close, trigger, f"{d} 是 {d.month} 月最后一个交易日")
+        return Occasion("rebalance", d, close, trigger,
+                        f"{d} 是 {d.month} 月最后一个交易日；收盘依据 {why}")
 
     # 周内最后交易日：下一个交易日的 ISO 周与今天不同
     if nxt.isocalendar()[:2] != d.isocalendar()[:2]:
-        return Occasion("week", d, close, trigger, f"{d} 是本周最后一个交易日")
+        return Occasion("week", d, close, trigger, f"{d} 是本周最后一个交易日；收盘依据 {why}")
 
     # close 要透传：原来这里塞 None，日志就打成「收盘 None；触发 20:30」自相矛盾
-    return Occasion("none", d, close, trigger, f"{d} 既非月末也非周末最后交易日")
+    return Occasion("none", d, close, trigger,
+                    f"{d} 既非月末也非周末最后交易日；收盘依据 {why}")
 
 
 def in_execution_window(now: dt.datetime, occasion: Occasion,
