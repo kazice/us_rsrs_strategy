@@ -45,6 +45,11 @@ env:
   TA_STATE_DIR: ${{ github.workspace }}/data/state/live
   TA_RUN_ID: ${{ github.run_id }}
   TZ: Asia/Shanghai
+  # 三个数据源密钥提到顶层：原来只挂在 data job 的某一步上，
+  # 导致 signal job 里 config 读到空值，降级链和日历校验都只有 yahoo/内置规则
+  ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+  ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+  TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
 
 jobs:
   signal:
@@ -76,7 +81,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/live_signal.log"
       - name: 上传运行日志（兜底，14 天）
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: live-signal-${{ github.run_id }}
           path: ${{ runner.temp }}/live_signal.log
