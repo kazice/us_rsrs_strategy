@@ -2,7 +2,6 @@
 
 布局：
     data/curated/bars_daily/symbol=<TICKER>/part.parquet   文件内不含 symbol，靠 hive 分区列
-    data/meta/state.json                                   每只股票的增量状态
 
 设计取舍：每只股票一个 Parquet 全历史文件。1000 只 x 20 年约 500 万行，列裁剪后
 单只读取 1~5ms；DuckDB 直接把整个目录当一张 `bars` 视图查，比 SQLite 快一个量级。
@@ -10,10 +9,8 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -72,10 +69,6 @@ def bars_dir() -> Path:
 
 def bars_file(symbol: str) -> Path:
     return bars_dir() / f"symbol={symbol}" / "part.parquet"
-
-
-def state_file() -> Path:
-    return data_root() / "meta" / "state.json"
 
 
 def _normalize(df: pd.DataFrame, source: str | None = None) -> pd.DataFrame:
@@ -263,46 +256,6 @@ def last_dates() -> pd.Series:
     finally:
         con.close()
     return pd.Series(pd.to_datetime(df["last_date"]).values, index=df["symbol"].values)
-
-
-# ---------------------------------------------------------------- state (json)
-
-def read_state() -> dict:
-    path = state_file()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def write_state(state: dict) -> None:
-    path = state_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=1, sort_keys=True)
-    os.replace(tmp, path)
-
-
-def touch_state(symbol: str, df: pd.DataFrame, source: str, status: str = "ok", error: str = "") -> dict:
-    """更新单只股票的增量状态并返回该条记录。"""
-    state = read_state()
-    last = df.iloc[-1] if len(df) else None
-    state[symbol] = {
-        "last_date": str(pd.Timestamp(last["date"]).date()) if last is not None else None,
-        "last_close": float(last["close"]) if last is not None else None,
-        "last_adj_close": float(last["adj_close"]) if last is not None else None,
-        "rows": int(len(df)),
-        "source": source,
-        "status": status,
-        "error": error,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    write_state(state)
-    return state[symbol]
 
 
 def missing_symbols(expected: Iterable[str]) -> list[str]:
