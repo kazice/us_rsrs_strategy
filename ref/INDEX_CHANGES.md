@@ -3,7 +3,7 @@
 > 由 `quant.live.pool.refresh()` 在每次成功刷新 SSGA holdings 后重新生成，
 > 数据源是同目录的 `index_changes.csv`。**不要手工编辑**，改了下次会被覆盖。
 
-> 当前快照：`us_sector_holdings.csv`，as of 2026-11-13，503 只
+> 当前快照：`us_sector_holdings.csv`，as of 2026-11-16，503 只
 
 ## 汇总
 
