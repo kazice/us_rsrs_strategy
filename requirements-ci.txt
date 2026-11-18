@@ -1,0 +1,11 @@
+# CI（signal / data / test 三个 job）共用的锁定依赖，版本取自本地验证通过的环境（Python 3.12）。
+# pandas 3.x 的 str dtype 之前踩过坑，升级前先本地跑 pytest 再改这里。
+pandas==3.1.0
+numpy==2.5.4
+pyarrow==26.0.0
+duckdb==2.0.0
+PyYAML==6.0.3
+requests==2.34.2
+yfinance==1.7.0
+openpyxl==3.1.5
+pytest==9.2.0

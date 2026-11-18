@@ -9,8 +9,9 @@
   并在腾讯个别票缺失时兜底（此时用 市值/价格 反推股本算换手率，口径略差，会被标注）。
 
 两者都是免费、无 key、国内可直连；在 GitHub Actions（美区）上也能通。但它们对美股
-都有**服务端延迟**（实测约 1~1.5 小时），所以每个报价都带数据源时间戳，
-调用方必须用 ``lag_minutes`` 判断这份数据能不能支撑 15:30 的决策——本项目不做静默处理。
+都有**服务端延迟**（早期手测约 1~1.5 小时，**未经 runs.jsonl 验证**），所以每个报价都带
+数据源时间戳，调用方必须用 ``lag_minutes`` 判断这份数据能不能支撑 15:30 的决策——本项目
+不做静默处理。实际滞后会写进 runs.jsonl 的 ``lag_min``，阈值见 ``live_signal --lag-refuse-min``。
 """
 from __future__ import annotations
 
@@ -21,7 +22,11 @@ import time
 import urllib.request
 from dataclasses import dataclass
 
+from zoneinfo import ZoneInfo
+
 from quant.live.calendar import ET
+
+_BJ = ZoneInfo("Asia/Shanghai")
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +34,13 @@ TENCENT_QUOTE = "https://qt.gtimg.cn/q={codes}"
 SINA_QUOTE = "https://hq.sinajs.cn/list={codes}"
 TENCENT_BATCH = 60
 SINA_BATCH = 80
+HTTP_RETRIES = 3          # 每批请求的尝试次数（含首次）；退避 1s、2s
+# 换手率自校验容差。腾讯换手率只给两位小数，真正同源的数据误差远小于 2%；
+# 原来的 6% 足以让「20% 换手上限」这类硬阈值的判定翻转。
+TURN_ABS_TOL = 0.02
+TURN_REL_TOL = 0.02
+# 两源成交量比值容差：超出只写 notes（推送里可见），不改数值也不中止
+RECONCILE_RATIO = (0.93, 1.075)
 
 _RE_TENCENT = re.compile(r'v_us([A-Za-z0-9.\-]+)="([^"]*)"')
 _RE_SINA = re.compile(r'hq_str_gb_([A-Za-z0-9.\-]+)="([^"]*)"')
@@ -77,10 +89,22 @@ def _variants(sym: str) -> list[str]:
     return out
 
 
-def _http(url: str, headers: dict[str, str], timeout: float = 20.0) -> str:
+def _http(url: str, headers: dict[str, str], timeout: float = 20.0,
+          retries: int = HTTP_RETRIES) -> str:
+    """GET 并解码；网络层失败重试（限流/抖动常是瞬时的），重试用尽才抛出。"""
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+    raw = b""
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            break
+        except Exception as exc:
+            if attempt >= retries:
+                raise
+            log.warning("报价请求第 %d 次失败（%s），%ds 后重试",
+                        attempt, type(exc).__name__, attempt)
+            time.sleep(float(attempt))
     for enc in ("gb18030", "utf-8"):
         try:
             return raw.decode(enc)
@@ -129,7 +153,7 @@ def _resolve_turnover(fields: list[str], idx: int, volume: float) -> tuple[float
             if sh is None or sh <= volume * 1.2:
                 continue
             implied = volume / sh * 100.0
-            if abs(implied - turn) <= max(0.02, 0.06 * turn):
+            if abs(implied - turn) <= max(TURN_ABS_TOL, TURN_REL_TOL * turn):
                 return turn, sh
             break                           # 只认末段最大的那个数，继续换 turn 试
     best = 0.0
@@ -212,11 +236,15 @@ def sina_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
                 continue
             if price <= 0:
                 continue
-            # 新浪的美股时间戳是北京时间，换算成 ET 才能和收盘时间比较
+            # 新浪 fields[3] 是北京时间：必须带上 Asia/Shanghai 时区再转 ET。
+            # 旧写法「减 8 小时再贴 ET 标签」会把时刻偏到未来约 5 小时，滞后变成负数，
+            # 陈旧报价反而能通过「滞后超过 45 分钟」的闸门。
+            # 注意：盘前/盘后该字段是新浪的刷新时刻（实测 = 当前墙钟），并非最后成交时刻，
+            # 所以新浪兜底的报价无法靠这个时间戳识别陈旧；交给 _quote_session 等闸门。
             ts = None
             try:
                 bj = dt.datetime.strptime(fields[3], "%Y-%m-%d %H:%M:%S")
-                ts = (bj - dt.timedelta(hours=8)).replace(tzinfo=ET)
+                ts = bj.replace(tzinfo=_BJ).astimezone(ET)
             except (ValueError, IndexError):
                 pass
             shares = mktcap / price if price > 0 else 0.0
@@ -230,7 +258,7 @@ def sina_quotes(symbols: list[str], pause: float = 0.15) -> dict[str, Quote]:
 
 
 def fetch_quotes(symbols: list[str],
-                 reconcile_ratio: tuple[float, float] = (0.85, 1.18),
+                 reconcile_ratio: tuple[float, float] = RECONCILE_RATIO,
                  ) -> tuple[dict[str, Quote], dict[str, str]]:
     """腾讯为主、新浪校验/兜底。
 

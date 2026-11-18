@@ -249,6 +249,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印不推送、不记账")
     ap.add_argument("--no-journal", action="store_true",
                     help="不写运行流水与决策快照（只在临时排错时用，正常运行不要加）")
+    ap.add_argument("--lag-refuse-min", type=float, default=LAG_REFUSE_MIN,
+                    help="报价滞后超过多少分钟就中止（实际滞后写在 runs.jsonl 的 lag_min）")
     ap.add_argument("--late-min", type=int, default=40,
                     help="允许迟到多少分钟（吃掉 Actions 的排队延迟）")
     ap.add_argument("--early-min", type=int, default=5,
@@ -271,11 +273,36 @@ def main() -> int:
         return _run(args, j, now, today_et, occ, kind)
     except SystemExit as exc:
         print(f"::error::{exc}")
+        _alert(j, args, "运行中止", f"{exc}")
         return j.finish(2, "abort", f"system_exit: {exc}")
     except Exception as exc:                            # noqa: BLE001
         log.exception("运行异常")
         print(f"::error::运行异常 {type(exc).__name__}: {exc}")
+        _alert(j, args, "运行异常", f"{type(exc).__name__}: {exc}")
         return j.finish(2, "error", f"{type(exc).__name__}: {exc}")
+
+
+def _alert(j, args, title: str, body: str) -> None:
+    """该出信号的那次运行失败了：主动推一条短消息。
+
+    原先中止只打一行 ::error:: 并写流水，手机上什么都收不到——月末调仓日就等于
+    「静默漏信号」。这里只在已通过窗口/幂等判定（``j.armed``）且非 dry-run 时发，
+    判定前的正常退出不会打扰人。告警本身失败只记日志，不影响退出码。
+    """
+    if args.dry_run or not getattr(j, "armed", False):
+        return
+    try:
+        notify.send(f"[模拟盘·异常] {title}",
+                    f"run {j.run_id}\n\n{body}\n\n**本次信号未推送**，请自行看盘口判断。")
+    except Exception:                                   # noqa: BLE001
+        log.exception("异常告警推送失败")
+
+
+def _abort(j, args, status: str, reason: str, msg: str) -> int:
+    """已 armed 之后的中止出口：打印 → 告警 → 记流水，三件事一起做不会漏。"""
+    print(f"::error::{msg}")
+    _alert(j, args, "信号中止", msg)
+    return j.finish(2, status, reason)
 
 
 def _run(args, j, now, today_et, occ, kind) -> int:
@@ -297,21 +324,25 @@ def _run(args, j, now, today_et, occ, kind) -> int:
         print(f"{day} 的 {kind} 已推送过，幂等跳过。")
         return j.finish(0, "noop", "already_pushed")
 
+    # 走到这里就是「本该出信号」：此后任何中止都要主动告警
+    j.armed = True
+
     # --- 报价 ---
     members = signal_mod.load_members()
     if members.empty:
-        print("::error::成分股与行情池交集为空")
-        return j.finish(2, "abort", "empty_pool")
+        return _abort(j, args, "abort", "empty_pool", "成分股与行情池交集为空")
     syms = list(dict.fromkeys(signal_mod.SECTOR_ETFS + [signal_mod.BENCH]
                               + list(members["symbol"])))
     quote_map, qnotes = quotes.fetch_quotes(syms)
     if len(quote_map) < len(syms) * 0.5:
-        print(f"::error::报价只拿到 {len(quote_map)}/{len(syms)}，数据源异常，中止")
-        return j.finish(2, "abort", f"quotes_{len(quote_map)}_of_{len(syms)}")
+        return _abort(j, args, "abort", f"quotes_{len(quote_map)}_of_{len(syms)}",
+                      f"报价只拿到 {len(quote_map)}/{len(syms)}，数据源异常，中止")
 
     # 用「本次判定使用的时刻」而不是墙上时钟：--now 复现某次决策时，报价滞后要相对那个
     # 时刻算，否则复现永远被判定为「数据滞后数小时」而中止
     lag_min, lag_n = quotes.describe_lag(quote_map, now)
+    j.extra["lag_min"] = None if lag_min is None else round(lag_min, 1)
+    j.extra["quotes"] = len(quote_map)
     warnings: list[str] = []
     lag_txt = "未知（报价无时间戳）"
     if lag_min is not None:
@@ -321,17 +352,16 @@ def _run(args, j, now, today_et, occ, kind) -> int:
             warnings.append(f"报价滞后 {lag_min:.0f} 分钟，换手率可能偏低，请以盘口为准")
         # 硬闸门只在「真的在盘中跑」时生效。用 --now 复现历史/未来时点，报价必然对不上那个
         # 时刻，此时中止没有任何意义，只会让人误以为链路坏了。
-        if lag_min > LAG_REFUSE_MIN and not args.now:
-            print(f"::error::报价滞后 {lag_min:.0f} 分钟，已超过 {LAG_REFUSE_MIN:.0f} 分钟，"
-                  f"不足以支撑收盘前 30 分钟的决策，中止且不推送")
-            return j.finish(2, "abort", f"stale_quotes_{lag_min:.0f}min")
+        if lag_min > args.lag_refuse_min and not args.now:
+            return _abort(j, args, "abort", f"stale_quotes_{lag_min:.0f}min",
+                          f"报价滞后 {lag_min:.0f} 分钟，已超过 {args.lag_refuse_min:.0f} 分钟，"
+                          f"不足以支撑收盘前 30 分钟的决策，中止且不推送")
 
     # --- 信号 ---
     try:
         sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes)
     except SystemExit as exc:      # 报价还是上一交易日的快照、行情历史不够等硬性条件
-        print(f"::error::{exc}")
-        return j.finish(2, "abort", "compute_abort")
+        return _abort(j, args, "abort", "compute_abort", str(exc))
     j.pick, j.sector = sig.pick, sig.sector
 
     # 口径日与请求日不一致：当日数据还没到（周末/盘前/数据源没翻页），signal 已退回最近一根
@@ -339,9 +369,9 @@ def _run(args, j, now, today_et, occ, kind) -> int:
     # 根本没在当天决策过的交易。
     if pd.Timestamp(sig.asof).date() != pd.Timestamp(today_et).date():
         if kind == "rebalance" and not args.now:
-            print(f"::error::调仓日 {today_et} 拿不到当日行情（口径退到 {sig.asof:%Y-%m-%d}），"
-                  f"不按旧口径下单调仓，中止且不推送")
-            return j.finish(2, "abort", f"fallback_{sig.asof:%Y%m%d}")
+            return _abort(j, args, "abort", f"fallback_{sig.asof:%Y%m%d}",
+                          f"调仓日 {today_et} 拿不到当日行情（口径退到 {sig.asof:%Y-%m-%d}），"
+                          f"不按旧口径下单调仓，中止且不推送")
         warnings.append(f"本信号按 {sig.asof:%Y-%m-%d} 的口径计算（请求 {today_et}，"
                         f"当日数据未到），不能当作 {today_et} 的调仓依据")
 
@@ -352,10 +382,11 @@ def _run(args, j, now, today_et, occ, kind) -> int:
         last = f"{sig.data_last_bar:%Y-%m-%d}" if sig.data_last_bar is not None else "?"
         line = f"行情面板最新 {last}，落后信号日 {lag_td} 个交易日"
         if lag_td >= DATA_LAG_ABORT_TD and not args.now:
-            print(f"::error::{line}（阈值 {DATA_LAG_ABORT_TD}），数据链路已断，中止且不推送")
-            return j.finish(2, "abort", f"stale_data_{lag_td}td")
+            return _abort(j, args, "abort", f"stale_data_{lag_td}td",
+                          f"{line}（阈值 {DATA_LAG_ABORT_TD}），数据链路已断，中止且不推送")
         # 不到中止阈值就只告警：这句同时会进推送正文（signal 已把它写进 notes）
         print(f"::warning::{line}（阈值 {DATA_LAG_ABORT_TD}），RSRS/均线用的是旧收盘")
+
 
     pos = books.load_position()
     holding_ret = books.mark_to_market(pos, quote_map, sig.factors)
@@ -377,6 +408,9 @@ def _run(args, j, now, today_et, occ, kind) -> int:
         title, content = render_rebalance(sig, action, detail, pos, holding_ret, ctx, pctx)
     else:
         title, content = render_week(sig, pos, holding_ret, ctx, pctx)
+
+    # 推送正文带 run_id：data 分支回写失败导致重复推送时，能靠它对上是哪次运行
+    content = f"{content}\n\n`run {j.run_id}`"
 
     print("\n" + "=" * 72)
     print(title)

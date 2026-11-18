@@ -279,6 +279,9 @@ def main() -> int:
                     help="最小市值门槛（亿美元），0 = 不限。剔除指数尾部小票：它们的"
                          "换手率分母小、噪声大，且天然高换手，会让按换手率排序的策略"
                          "系统性偏向小市值票")
+    ap.add_argument("--mcap-shares", default="ws", choices=["ws", "static"],
+                    help="--min-mcap 的股本口径：ws = 与实盘一致（5 日反推→SEC，逐日无前视，默认）；"
+                         "static = 旧口径（全样本中位数+今日快照，含前视，仅作对照）")
     ap.add_argument("--pool-top", type=int, default=500,
                     help="--pool-mode mcap 时的池子容量（标普 500 约 500 只）")
     ap.add_argument("--pool-shares", default="current", choices=["current", "sec"],
@@ -389,19 +392,52 @@ def main() -> int:
                                  / "turnover_daily.parquet")
         tv_p = tv_all.pivot(index="date", columns="symbol", values="turnover").sort_index()
         cols_m = [c for c in stocks if c in vol_m.columns and c in px_c.columns]
-        # 股本 = 成交量 ÷ 换手率 的逐日中位数；没有换手率的票用 universe 快照的 市值/价格 兜底
-        sh = (vol_m[cols_m] / tv_p.reindex(index=vol_m.index, columns=cols_m)).median()
-        uni_m = pd.read_parquet(universe.latest_file())
-        uni_m["symbol"] = uni_m["symbol"].astype(str).str.upper()
-        snap = (uni_m["market_cap"] / uni_m["price"]).replace([np.inf, -np.inf], np.nan)
-        snap.index = uni_m["symbol"].values
-        sh = sh.fillna(snap)
-        mcap = px_c[cols_m].mul(sh[cols_m], axis=1).reindex(cal).ffill()
+        implied = (vol_m[cols_m] / tv_p.reindex(index=vol_m.index, columns=cols_m)
+                   .where(lambda x: x > 0)).replace([np.inf, -np.inf], np.nan)
+        if args.mcap_shares == "static":
+            # 旧口径（含前视，仅作对照）：全样本中位数 + universe 快照兜底
+            sh = implied.median()
+            uni_m = pd.read_parquet(universe.latest_file())
+            uni_m["symbol"] = uni_m["symbol"].astype(str).str.upper()
+            snap = (uni_m["market_cap"] / uni_m["price"]).replace([np.inf, -np.inf], np.nan)
+            snap.index = uni_m["symbol"].values
+            sh = sh.fillna(snap)
+            mcap = px_c[cols_m].mul(sh[cols_m], axis=1).reindex(cal).ffill()
+        else:
+            # 与实盘 quant.live.mcap 同口径（逐日、无前视）：
+            # ① 最近 5 个交易日 成交量÷换手率 的中位数（至少 3 个有效点）
+            # ② 缺失时用 SEC 申报股本（filed ≤ 当日，且不超过 400 天）
+            # 快照那一级历史上不可得（只有今天一份），回测不用
+            # 回测的 pit 池里有已调出/退市的票，换手率面板对它们有缺口（实盘池全是现成分股，无此问题）。
+            # 缺口处沿用「最近一次可信股本」最多 250 个交易日（只用过去，无前视），再退到 SEC，
+            # 否则这些小票会因「取不到市值→保留」而混进候选池
+            sh_ws = implied.rolling(5, min_periods=3).median().ffill(limit=250)
+            so_path = ROOT / "data" / "curated" / "fundamentals" / "shares_outstanding.parquet"
+            sh_t = sh_ws
+            if so_path.exists():
+                so = pd.read_parquet(so_path)
+                so["symbol"] = so["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
+                so["filed"] = pd.to_datetime(so["filed"], errors="coerce")
+                so = so[(so["val"] > 1000) & so["filed"].notna() & so["symbol"].isin(cols_m)]
+                so = so.sort_values("filed").groupby(["filed", "symbol"]).tail(1)
+                idx = vol_m.index.union(pd.DatetimeIndex(so["filed"].unique())).sort_values()
+                val = so.pivot(index="filed", columns="symbol", values="val").reindex(idx).ffill()
+                fdate = so.assign(f=so["filed"]).pivot(index="filed", columns="symbol", values="f")
+                fdate = fdate.reindex(idx).ffill()
+                age = pd.DataFrame(idx.values[:, None] - fdate.values, index=idx, columns=fdate.columns)
+                val = val.where(age <= pd.Timedelta(days=400))
+                val = val.reindex(index=vol_m.index, columns=cols_m)
+                sh_t = sh_ws.where(sh_ws.notna(), val)
+            # ④ 仍缺（换手率面板整段缺失，如 MTCH 2023-10~2025-09 不在面板内）：退到全样本中位数。
+            #    这一级含前视，但只补数据缺口，股本变化慢，且比「取不到→保留」更接近实盘
+            sh_t = sh_t.fillna(implied.median())
+            mcap = (px_c[cols_m] * sh_t).reindex(cal)     # 不 ffill：当日取不到就是未知（保留）
         ok = (mcap > thr) | mcap.isna()      # 拿不到市值的保留，靠换手率那一步自然淘汰
         ok = ok.reindex(columns=stocks).fillna(True).astype(bool)
         gone = sorted(s for s in stocks if not bool(ok[s].any()))
         pool_mask = ok if pool_mask is None else (pool_mask & ok)
-        print(f"--min-mcap {args.min_mcap:.0f} 亿美元：全程不达标的 {len(gone)} 只移出候选 "
+        print(f"--min-mcap {args.min_mcap:.0f} 亿美元（股本口径 {args.mcap_shares}）："
+              f"全程不达标的 {len(gone)} 只移出候选 "
               f"({' '.join(gone[:16])}{' ...' if len(gone) > 16 else ''})")
 
     def in_pool(sym: str, dt_: pd.Timestamp) -> bool:
@@ -737,7 +773,7 @@ def main() -> int:
     if args.pool_mode == "pit":
         ptag += "_ppit"
     if args.min_mcap > 0:
-        ptag += f"_mc{int(args.min_mcap)}"
+        ptag += f"_mc{int(args.min_mcap)}" + ("_mcstat" if args.mcap_shares == "static" else "")
     if args.anchor_lag:
         ptag += f"_al{args.anchor_lag}"
     if args.regime_ma > 0:

@@ -93,6 +93,9 @@ class Journal:
         self.sector = ""
         self.notify: str = "skipped"       # skipped / ok / failed
         self.extra: dict[str, Any] = {}
+        # 通过「该不该跑」的判定后置 True。此后的任何中止/异常都意味着「本该收到信号却没有」，
+        # 需要主动告警；判定前的退出（非调仓日、不在窗口）是正常的，不能打扰人。
+        self.armed: bool = False
 
     # ------------------------------------------------------------------ 快照
     def snapshot(self, sig, quotes: dict, *, title: str = "", content: str = "",
