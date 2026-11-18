@@ -91,12 +91,52 @@ def desired_crons(now: dt.datetime) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Cloudflare
 # --------------------------------------------------------------------------- #
+def _env(name: str) -> str:
+    """读环境变量并清掉粘贴时常见的污染：首尾空白、成对引号、``Bearer `` 前缀。"""
+    v = os.environ.get(name, "").strip().strip('"').strip("'").strip()
+    if v.lower().startswith("bearer "):
+        v = v[7:].strip()
+    return v
+
+
+def _shape(v: str) -> str:
+    """只描述形态，不泄露值：长度 + 是否像 32 位十六进制（token ID / account ID 的形状）。"""
+    if not v:
+        return "空"
+    hex32 = len(v) == 32 and all(c in "0123456789abcdefABCDEF" for c in v)
+    return f"长度 {len(v)}" + ("，形如 32 位十六进制 ID（很可能填成了 ID 而不是 token 值）" if hex32 else "")
+
+
+def _diag() -> str:
+    """Cloudflare 认证失败时，输出不含敏感值的诊断信息。"""
+    raw_t = os.environ.get("CF_API_TOKEN", "")
+    raw_a = os.environ.get("CF_ACCOUNT_ID", "")
+    t, a = _env("CF_API_TOKEN"), _env("CF_ACCOUNT_ID")
+    lines = [
+        f"CF_API_TOKEN：{_shape(t)}",
+        f"  - 原始值与清洗后不同：{'是（含有空白/引号/Bearer 前缀）' if raw_t != t else '否'}",
+        f"CF_ACCOUNT_ID：{_shape(a)}",
+        f"  - 原始值与清洗后不同：{'是' if raw_a != a else '否'}",
+    ]
+    try:
+        req = urllib.request.Request(f"{CF}/accounts/{a}/tokens/verify",
+                                     headers={"Authorization": f"Bearer {t}", "User-Agent": "cron-sync-diag"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            d = json.loads(resp.read().decode())
+        lines.append(f"token 校验：{(d.get('result') or {}).get('status', d.get('success'))}")
+    except urllib.error.HTTPError as exc:
+        lines.append(f"token 校验：HTTP {exc.code} {exc.read()[:160]!r}")
+    except Exception as exc:                                    # noqa: BLE001
+        lines.append(f"token 校验：{type(exc).__name__}: {exc}")
+    return "\n".join(lines)
+
+
 def _cf(method: str, body: object | None = None) -> dict:
-    url = (f"{CF}/accounts/{os.environ['CF_ACCOUNT_ID']}/workers/scripts/{WORKER}/schedules")
+    url = f"{CF}/accounts/{_env('CF_ACCOUNT_ID')}/workers/scripts/{WORKER}/schedules"
     req = urllib.request.Request(
         url, method=method,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"Authorization": f"Bearer {os.environ['CF_API_TOKEN']}",
+        headers={"Authorization": f"Bearer {_env('CF_API_TOKEN')}",
                  "Content-Type": "application/json", "User-Agent": "paper-trade-cron-sync"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -152,6 +192,9 @@ def cmd_check(now: dt.datetime) -> int:
         if apply_crons(desired_crons(now)):
             problems.append("Cloudflare 上的 Cron 与预期不一致，已自动重设（说明闭环曾断链）")
     except Exception as exc:                                    # noqa: BLE001
+        print("::group::Cloudflare 认证诊断")
+        print(_diag())
+        print("::endgroup::")
         problems.append(f"无法核对/重设 Cloudflare Cron：{exc}")
 
     start = max(now - dt.timedelta(hours=26), MIGRATED_AT)
