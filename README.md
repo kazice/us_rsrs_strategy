@@ -26,6 +26,7 @@
 config/settings.yaml                数据源与路径
 config/ref/us_sector_holdings.csv   成分股兜底快照
 docs/HANDOFF.md                     交接文档：策略核心、逐文件职责、口径陷阱（接手先读这个）
+docs/BACKTEST_HANDOFF.md            回测交接：一条命令复现、定稿参数、产物字段、无前视口径、扫参
 docs/PAPER_TRADING.md               模拟盘：链路、候选池、与回测的口径差异
 docs/LIVE_LOG.md                    日志与回溯：目录、字段、查询命令、注意事项
 scripts/live_signal.py              信号入口（含日志落盘）
@@ -39,6 +40,17 @@ src/quant/data/                     行情层（store/fetch/universe/sources）
 
 `docs/HANDOFF.md` 是给下一个开发者/AI 的完整交接：策略核心与公式、每个文件的职责、
 数据结构、数据契约、12 条口径陷阱、改需求该动哪个文件、禁止事项。
+
+跑回测看 `docs/BACKTEST_HANDOFF.md`：一条命令复现定稿结果（含对账基准数字）、参数逐条对照、
+目录名反查表、产物字段、无前视口径清单、参数扫描套路与陷阱。
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m scripts.sector_stock_rsrs --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2026-10-26 --tag merged
+```
+
+看板：`python -m scripts.build_web_report --pattern "*_merged" --out reports/web/index.html`，
+产物为单文件 HTML（`reports/web/index.html`、`reports/web/bear_etfs.html`）。
 
 ## 本地运行
 
