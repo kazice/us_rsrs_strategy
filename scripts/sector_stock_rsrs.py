@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant.data import store, universe
+from quant.data import crsp, store, universe
 from scripts.sector_rsrs import anchors, perf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -416,6 +416,12 @@ def main() -> int:
                     help="--pool-mode mcap 算市值用的股本：current = universe 快照的当前股本"
                          "（全市场覆盖，复权价 × 当前股本）；sec = 只在有 SEC 申报股本的"
                          "501 只里排名（无过滤效果，仅对照）")
+    ap.add_argument("--data-source", default="local", choices=["local", "crsp"],
+                    help="行情/换手率/市值/成分股的数据源：local = yfinance 行情 + westock 换手率 + "
+                         "快照市值（旧口径）；crsp = 买来的标普 500 标准数据（PIT 成分、真实股本与市值）")
+    ap.add_argument("--crsp-scope", default="all", choices=["all", "pool", "metrics"],
+                    help="只用 crsp 数据源的哪一部分（做归因实验用）：all = 成分股+换手率+市值+价格；"
+                         "pool = 只把成分股换成 PIT；metrics = 只换换手率/市值/价格，池子仍用快照")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
 
@@ -434,6 +440,11 @@ def main() -> int:
                       + [int(x) for x in str(args.trend_cross).split(",") if x.strip()])
         warm = max(warm, int(trend_w * 1.6) + 60)
     load_start = (start - pd.DateOffset(days=warm)).strftime("%Y-%m-%d")
+    use_crsp = args.data_source == "crsp"
+    use_crsp_pool = use_crsp and args.crsp_scope in ("all", "pool")
+    use_crsp_metrics = use_crsp and args.crsp_scope in ("all", "metrics")
+    if use_crsp and not crsp.available():
+        raise SystemExit("CRSP 数据不存在：先跑 python -m scripts.import_crsp_sp500")
 
     members = load_members()
     sec_of = dict(zip(members["symbol"], members["sector_etf"]))
@@ -441,6 +452,15 @@ def main() -> int:
     stocks = list(members["symbol"])
     pit_ev = None
     pit_anchor: set[str] = set()
+    if use_crsp_pool:
+        # 成分股改用 CRSP 的当期名单：窗口内当过成分的所有票（含后来被剔除、退市的），
+        # 这才是「当时能买到」的池子；今天的 503 只快照含 58 只当时还没进指数的票。
+        crsp_win = crsp.symbols_in_window(start, end)
+        smap = crsp.sector_map(crsp_win)
+        sec_of.update(dict(zip(smap["symbol"], smap["sector_etf"])))
+        stocks = list(crsp_win)
+        n_sic = int((smap["src"] == "sic").sum())
+        print(f"--data-source crsp：窗口内成分 {len(stocks)} 只（{n_sic} 只板块归属按 SIC 补齐）")
     if args.pool_mode == "pit":
         pit_ev = load_sp500_change_events()
         pit_anchor = set(stocks)
@@ -481,13 +501,24 @@ def main() -> int:
               f"{' '.join(late[:30])}{' ...' if len(late) > 30 else ''}")
     print(f"成分股 {len(stocks)} 只在本地行情池内（11 板块，快照 2026-11-11）")
 
-    syms = SECTOR_ETFS + [BENCH] + stocks
-    hi = store.load_panel(field="high", symbols=syms, start=load_start,
-                          end=end.strftime("%Y-%m-%d")).sort_index().ffill()
-    lo = store.load_panel(field="low", symbols=syms, start=load_start,
-                          end=end.strftime("%Y-%m-%d")).sort_index().ffill()
-    px = store.load_panel(field="adj_close", symbols=syms, start=load_start,
-                          end=end.strftime("%Y-%m-%d")).sort_index().ffill()
+    etf_syms = SECTOR_ETFS + [BENCH]
+    end_s = end.strftime("%Y-%m-%d")
+    if use_crsp_metrics:
+        # ETF 仍用本地行情（CRSP 只覆盖标普 500 成分股），个股用 CRSP 自己的复权价
+        def _both(field: str, crsp_field: str) -> pd.DataFrame:
+            left = store.load_panel(field=field, symbols=etf_syms, start=load_start, end=end_s)
+            right = crsp.panel(crsp_field, stocks, load_start, end_s)
+            return pd.concat([left, right], axis=1).sort_index().ffill()
+
+        hi, lo, px = _both("high", "high"), _both("low", "low"), _both("adj_close", "adj_close")
+    else:
+        syms = etf_syms + stocks
+        hi = store.load_panel(field="high", symbols=syms, start=load_start,
+                              end=end_s).sort_index().ffill()
+        lo = store.load_panel(field="low", symbols=syms, start=load_start,
+                              end=end_s).sort_index().ffill()
+        px = store.load_panel(field="adj_close", symbols=syms, start=load_start,
+                              end=end_s).sort_index().ffill()
 
     # 区间内完全没有行情的成分股（多为区间之后才上市/拆分出来的票）直接剔除，
     # 否则 px[stocks] / hi[stocks] 会因列缺失报 KeyError。
@@ -510,7 +541,12 @@ def main() -> int:
 
     # 逐期成分股池（--pool-mode mcap 时启用）。默认 snapshot = 用今天的名单回测过去。
     pool_mask = None
-    if args.pool_mode == "mcap":
+    if use_crsp_pool:
+        # CRSP 自带成分区间，直接给逐日 PIT 掩码；不需要再按公告回放
+        pool_mask = crsp.membership_mask(cal, stocks)
+        for d in (cal[0], cal[len(cal) // 2], cal[-1]):
+            print(f"  {d.date()} 在池 {int(pool_mask.loc[d].sum())} 只（CRSP PIT）")
+    elif args.pool_mode == "mcap":
         pool_mask = mcap_pool_mask(stocks, cal, load_start, end.strftime("%Y-%m-%d"),
                                    args.pool_top, args.pool_shares)
     elif args.pool_mode == "pit":
@@ -521,7 +557,19 @@ def main() -> int:
     # 会让「按换手率排序」系统性偏向指数尾部的小票（NCLH 市值 65~100 亿美元、
     # 日换手 5%，长期排在 XLY 第一）。这是口径修正，不是调参。
     mcap_panel = None
-    if args.min_mcap > 0 or bear_turn5:
+    if use_crsp_metrics and (args.min_mcap > 0 or bear_turn5):
+        # CRSP 直接给当期市值（DlyCap），不需要反推股本，也没有前视
+        mcap = crsp.mcap_panel(stocks, load_start, end.strftime("%Y-%m-%d")).reindex(cal)
+        mcap_panel = mcap
+        if args.min_mcap > 0:
+            ok = (mcap > args.min_mcap * 1e8) | mcap.isna()
+            ok = ok.reindex(columns=stocks).fillna(True).astype(bool)
+            gone = sorted(s for s in stocks if not bool(ok[s].any()))
+            pool_mask = ok if pool_mask is None else (pool_mask & ok)
+            print(f"--min-mcap {args.min_mcap:.0f} 亿美元（口径 crsp）："
+                  f"全程不达标的 {len(gone)} 只移出候选 "
+                  f"({' '.join(gone[:16])}{' ...' if len(gone) > 16 else ''})")
+    elif args.min_mcap > 0 or bear_turn5:
         vol_m = store.load_panel(field="volume", symbols=stocks, start=load_start,
                                  end=end.strftime("%Y-%m-%d")).sort_index()
         px_c = store.load_panel(field="close", symbols=stocks, start=load_start,
@@ -598,8 +646,10 @@ def main() -> int:
     dvol_cv = None
     if (args.pick in ("turn", "dvol", "dvolcv", "dvolcvh", "cvdown", "turnma")
             or bear_turn5):
-        vol = store.load_panel(field="volume", symbols=stocks, start=load_start,
-                               end=end.strftime("%Y-%m-%d")).sort_index()
+        vol = (crsp.panel("volume", stocks, load_start, end.strftime("%Y-%m-%d")).sort_index()
+               if use_crsp_metrics else
+               store.load_panel(field="volume", symbols=stocks, start=load_start,
+                                end=end.strftime("%Y-%m-%d")).sort_index())
         if args.pick in ("turn", "turnma") or bear_turn5:
             if args.turn_shares == "snapshot":
                 # 旧口径：用 universe 快照的 市值/价格 推算股本（前视，仅作对照）
@@ -619,11 +669,17 @@ def main() -> int:
             else:
                 # 数据源口径：腾讯自选股日 K 的换手率字段。注意它对美股是「成交量/总股本」
                 # 口径（实测 WMT/COIN/RDDT 全部对得上总股本），保留作对照，不是流通股本。
-                path = ROOT / "data" / "curated" / "fundamentals" / "turnover_daily.parquet"
-                if not path.exists():
-                    raise SystemExit(f"换手率面板不存在（应由 data 分支提供）：{path}")
-                tv = pd.read_parquet(path)
-                panel = tv.pivot(index="date", columns="symbol", values="turnover").sort_index()
+                if use_crsp_metrics:
+                    # CRSP 口径：成交量 ÷ 当日总股本，逐日真实值
+                    panel = crsp.turnover_panel(stocks, load_start, end.strftime("%Y-%m-%d"))
+                else:
+                    path = (ROOT / "data" / "curated" / "fundamentals"
+                            / "turnover_daily.parquet")
+                    if not path.exists():
+                        raise SystemExit(f"换手率面板不存在（应由 data 分支提供）：{path}")
+                    tv = pd.read_parquet(path)
+                    panel = tv.pivot(index="date", columns="symbol",
+                                     values="turnover").sort_index()
                 cols = [c for c in stocks if c in panel.columns]
                 missing = sorted(set(stocks) - set(cols))
                 raw = panel[cols].reindex(cal).ffill()
@@ -648,8 +704,9 @@ def main() -> int:
                     else:
                         turn_rate_120 = raw.rolling(120, min_periods=60).mean()
                     print(f"120 日均换手率面板完成 {turn_rate_120.shape}（自身常态基准）")
-                print(f"换手率面板完成 {turn_rate.shape}（数据源口径：westock 日 K 换手率，"
-                      f"美股为成交量/总股本，20 日均值，共 {len(cols)} 只；无数据 {len(missing)} 只）")
+                src_name = "CRSP 成交量/总股本" if use_crsp_metrics else "westock 日 K 换手率"
+                print(f"换手率面板完成 {turn_rate.shape}（{src_name}，20 日均值，"
+                      f"共 {len(cols)} 只；无数据 {len(missing)} 只）")
                 if missing:
                     print(f"  无换手率数据已剔除：{' '.join(missing[:20])}"
                           f"{' ...' if len(missing) > 20 else ''}")
@@ -1218,6 +1275,8 @@ def main() -> int:
     tag = f"_{args.tag}" if args.tag else ""
     ftag = "" if args.freq == "M" else f"_{args.freq}"
     ptag = "" if args.pick == "rsrs" else f"_{args.pick}"
+    if use_crsp:
+        ptag += "_crsp" + ("" if args.crsp_scope == "all" else f"_{args.crsp_scope}")
     if args.pick == "turn" and args.turn_rank > 1:
         ptag += f"_r{args.turn_rank}"
     if args.stop_loss > 0:

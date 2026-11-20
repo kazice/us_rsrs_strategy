@@ -415,6 +415,10 @@ def parse_params(dirname: str) -> list[tuple[str, str]]:
         return mm.group(1) if mm else None
 
     out = [("RSRS 窗口", f"N={m.group(1)} / M={m.group(2)}" if m else "-")]
+    if "_crsp" in (tail or ""):
+        scope = grab(r"_crsp_([a-z]+)")
+        out.append(("数据源", "CRSP 标普500 标准数据（PIT 成分 / 真实股本与市值）"
+                              + (f"，仅修 {scope}" if scope else "")))
     out.append(("板块内选股", {
         "turnma": "换手率降序 + 趋势闸（逐块下探）",
         "turn": "换手率排名", "cvdown": "成交额 CV 降序 + 趋势闸",

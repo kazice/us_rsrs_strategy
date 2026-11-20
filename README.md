@@ -19,6 +19,18 @@
 市值用**当日真实股本**算，不再用股本估算：Nasdaq 日快照（`market_cap / price`）→ 最近 5 日
 「成交量 ÷ 换手率」反推 → SEC 申报股本，逐级兜底，每只票的来源写进推送与 `candidates.csv`。
 
+**回测数据源（2026-11 修正）**：改用买来的标普 500 标准数据（CRSP 口径，`--data-source crsp`）——
+PIT 成分股、成交量÷总股本的真实换手率、当期真实市值、自带复权因子。旧口径用今天的 503 只快照
+回测过去，平均每期混入 58 只当时不在指数里的票、漏掉 58 只当时还在的票，累计收益虚高约 2 倍：
+
+| 同区间（2021-11 ~ 2025-12，50 期） | 累计 | 年化 | 夏普 | 最大回撤 |
+|---|---|---|---|---|
+| 旧口径（本地快照 + 估算股本） | +637.9% | 62.7% | 1.52 | −25.8% |
+| **CRSP 标准数据** | **+208.0%** | **31.5%** | **1.01** | −37.0% |
+| SPY | +54.8% | 11.2% | 0.63 | −24.5% |
+
+证据与归因见 `docs/DATA_AUDIT_CRSP.md`。**引用收益只能引 CRSP 口径。**
+
 ## 目录
 
 ```
@@ -27,6 +39,7 @@ config/settings.yaml                数据源与路径
 config/ref/us_sector_holdings.csv   成分股兜底快照
 docs/HANDOFF.md                     交接文档：策略核心、逐文件职责、口径陷阱（接手先读这个）
 docs/BACKTEST_HANDOFF.md            回测交接：一条命令复现、定稿参数、产物字段、无前视口径、扫参
+docs/DATA_AUDIT_CRSP.md             数据审计：收益虚高的来源、四项对账、归因实验、修正清单
 docs/PAPER_TRADING.md               模拟盘：链路、候选池、与回测的口径差异
 docs/LIVE_LOG.md                    日志与回溯：目录、字段、查询命令、注意事项
 scripts/live_signal.py              信号入口（含日志落盘）
@@ -46,7 +59,7 @@ src/quant/data/                     行情层（store/fetch/universe/sources）
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m scripts.sector_stock_rsrs --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2026-10-26 --tag merged
+python -m scripts.sector_stock_rsrs --data-source crsp --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2025-12-31 --tag crsp
 ```
 
 看板：`python -m scripts.build_web_report --pattern "*_merged" --out reports/web/index.html`，

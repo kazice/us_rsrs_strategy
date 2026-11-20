@@ -6,25 +6,29 @@
 
 ---
 
-## 1. 一条命令跑通（已实测，9.4 秒）
+## 1. 一条命令跑通（已实测，约 30 秒）
 
 Windows PowerShell，在仓库根目录：
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m scripts.sector_stock_rsrs --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2026-10-26 --tag merged
+python -m scripts.sector_stock_rsrs --data-source crsp --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2025-12-31 --tag crsp
 ```
 
-跑完打印 60 期逐期持仓表 + 汇总，结果写到：
+跑完打印 50 期逐期持仓表 + 汇总，结果写到：
 
 ```
-reports/etf/rsrs_stock_n20_m40_top1_turnma_strong_20-60_sl5_slma20-60_a50_x50-200_adx20_turnws_tratio_bref_cap20_tail48_mc500_reg200_bearnofilter_rw21_betfonly_bmin0_brankBoth3x120_merged/
+reports/etf/rsrs_stock_n20_m40_top1_turnma_crsp_strong_20-60_sl5_slma20-60_a50_x50-200_adx20_turnws_tratio_bref_cap20_tail48_mc500_reg200_bearnofilter_rw21_betfonly_bmin0_brankBoth3x120_crsp/
 ```
 
-**对账基准（改代码前后必比这几个数）**：个股版累计 **+2989.5%**、年化 100.8%、波动 46.7%、夏普 **2.158**、
-最大回撤 −36.9%；ETF 版 +114.3%；SPY +75.1%。区间 2021-11-15 ~ 2026-10-26，共 60 期；
-选股跑赢 ETF 35/60 期（累计选股差 +305.6%）；熊市 12 期（买 ETF 4 / 空仓 8）。
+**对账基准（改代码前后必比这几个数）**：个股版累计 **+208.0%**、年化 31.5%、波动 31.1%、
+夏普 **1.013**、最大回撤 −37.0%；ETF 版 +25.8%；SPY +54.8%。区间 2021-11-15 ~ 2025-12-31，共 50 期；
+选股跑赢 ETF 28/50 期（累计选股差 +91.7%）；熊市 12 期（买 ETF 4 / 空仓 8）。
 任何一位不对，说明改动已经改变了策略行为，先查口径再报结论。
+
+> ⚠ **旧数字已作废**：`--data-source local`（yfinance + westock + 今天 503 只快照）同区间跑出
+> +637.9% / 夏普 1.52，其中约 2/3 来自数据错误（幸存者偏差为主）。详见 `docs/DATA_AUDIT_CRSP.md`，
+> 那篇文章里有四项对账与归因实验。**引用收益只能引 CRSP 口径。**
 
 `PYTHONPATH=src` 不能省（脚本里 `from quant.data import store, universe`）。也可以 `pip install -e .` 装成包。
 
@@ -40,6 +44,7 @@ reports/etf/rsrs_stock_n20_m40_top1_turnma_strong_20-60_sl5_slma20-60_a50_x50-20
 | Universe 快照 | `data/meta/universe/universe_latest.parquet`（Nasdaq 市值快照，含 `market_cap` / `price`） | 市值门槛的股本只能靠反推 / SEC |
 | 成分股名单 | `config/ref/us_sector_holdings.csv`（SPDR 官方 holdings，503 只） | 板块下探无人可挑 |
 | SEC 股本 | `data/curated/fundamentals/shares_outstanding.parquet`（可缺） | 退回全样本中位数兜底，见第 9 节 |
+| **CRSP 标准数据**（定稿口径） | `data/curated/crsp_sp500/{daily,membership,symbols}.parquet`，由 `data/raw/crsp_sp500/*.csv` 转出 | `--data-source crsp` 直接报错退出（先跑 `python -m scripts.import_crsp_sp500`） |
 
 `data/` 是**独立 git 分支**（`origin/data`），不在 main 里。本地没有时：
 
@@ -58,6 +63,7 @@ $env:TA_DATA_ROOT = "d:\path\to\data"
 
 | 参数 | 值 | 作用 |
 |---|---|---|
+| `--data-source crsp` | **定稿口径** | 成分股用 PIT 名单、换手率 = 成交量/总股本、市值 = CRSP `DlyCap`、价格自带复权因子。`local` = 旧口径（已作废，仅作对照） |
 | `--n 20 --m 40` | 20 / 40 | RSRS 回归 / 标准化窗口（板块层与个股层共用） |
 | `--pick turnma` | 换手率降序 + 趋势闸 | 个股层不用 RSRS 排序，改用筹码活跃度 |
 | `--trend-mode strong` | 强化趋势闸 | 多头排列 + 均线斜率 + 站上长期均线 + ADX 四道闸 |
@@ -115,6 +121,7 @@ $env:TA_DATA_ROOT = "d:\path\to\data"
 | `_ppit` / `_pmcap500` | `--pool-mode pit` / `mcap`（**没有这两个就是 snapshot，含幸存者偏差**） |
 | `_al1` | `--anchor-lag 1`（提前一个交易日调仓） |
 | `_merged` | `--tag merged` |
+| `_crsp` / `_crsp_pool` / `_crsp_metrics` | `--data-source crsp`；后两个是 `--crsp-scope` 的归因实验 |
 
 > ⚠ 本文的定稿结果用的是默认 `--pool-mode snapshot`（用当前成分股回测过去，存在幸存者偏差）。
 > `README.md` 里"定稿口径"写的 `--pool-mode pit` 是**实盘对照**用的 PIT 版本，两套数字不可混用。
@@ -284,6 +291,10 @@ PowerShell 默认代码页会让中文输出变乱码（`��ȡ��`），**
 | 路径 | 职责 |
 |---|---|
 | `scripts/sector_stock_rsrs.py` | **回测主脚本**：双层 RSRS + 趋势闸 + 熊市分支 + 净值计算 + 写盘 |
+| `scripts/import_crsp_sp500.py` | CRSP CSV → parquet（成分区间 / 逐日行情 / 代码映射） |
+| `scripts/compare_crsp_data.py` | CRSP 与本地四项对账，产出 `reports/data_audit/crsp_vs_local.md` |
+| `src/quant/data/crsp.py` | CRSP 读取层：复权价 / 换手率 / 市值 / PIT 掩码 / SIC→板块 ETF |
+| `docs/DATA_AUDIT_CRSP.md` | **数据审计**：收益虚高的来源、四项对账、归因实验、修正清单 |
 | `scripts/sector_rsrs.py` | 单层板块 RSRS（`rsrs_panel` 参考实现、`anchors`、`perf` 被主脚本复用） |
 | `scripts/build_web_report.py` | 主看板生成（`reports/web/index.html`） |
 | `scripts/bear_etf_trends.py` | 熊市 ETF 副看板（`reports/web/bear_etfs.html`） |
@@ -311,10 +322,14 @@ python -m scripts.backfill_turnover --start 2021-01-01 --end 2023-10-01
 $env:PYTHONPATH = "src"
 
 # 定稿回测（第 1 节完整命令）
-python -m scripts.sector_stock_rsrs --n 20 --m 40 --pick turnma ... --tag merged
+python -m scripts.sector_stock_rsrs --data-source crsp --n 20 --m 40 --pick turnma ... --tag crsp
+
+# 数据侧（CRSP 标准数据）
+python -m scripts.import_crsp_sp500 --start 2020-01-01     # CSV → parquet
+python -m scripts.compare_crsp_data                        # 四项对账报告
 
 # 看板
-python -m scripts.build_web_report --pattern "*_merged" --out reports/web/index.html --title "…"
+python -m scripts.build_web_report --pattern "*_crsp" --out reports/web/index.html --title "…"
 python -m scripts.bear_etf_trends
 python -m http.server 8765 --directory reports/web
 
@@ -327,3 +342,14 @@ python -c "import pandas as pd;h=pd.read_csv(r'reports/etf/<参数串>/holds.csv
 
 改口径前先做三件事：① `git log -p` 看这段是谁为什么改的；② 用第 1 节的基准跑一次确认没漂；
 ③ 把新数字写进本文第 1 节与 `docs/HANDOFF.md` 的对应行。**不留数字的结论等于没跑过。**
+
+## 12. 数据源历史（为什么有两套口径）
+
+| 时间 | 口径 | 同区间结果（2021-11 ~ 2025-12，50 期） |
+|---|---|---|
+| ~2026-11 之前 | `local`：yfinance 行情 + westock 换手率 + 今天 503 只快照 + 反推股本 | +637.9% / 夏普 1.52 |
+| 2026-11 起 | `crsp`：标普 500 标准数据（PIT 成分 / 真实股本与市值 / 自带复权） | **+208.0% / 夏普 1.01** |
+
+差额约 2/3 来自数据错误：平均每期混入 58 只当时不在指数里的票、漏掉 58 只当时还在的票；
+换手率对多股本结构（GOOG/GOOGL、FOX/FOXA、NWS、DELL）低估 2~3 倍；市值在 500 亿门槛上 1% 的票日判反。
+完整证据见 `docs/DATA_AUDIT_CRSP.md`。

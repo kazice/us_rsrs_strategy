@@ -1,7 +1,8 @@
 # 行情与日志都在独立的 data 分支，不进主仓
-data/
-logs/
-state/
+# 注意前导斜杠：写成 `data/` 会连 `src/quant/data/` 一起忽略，新模块会静默漏提交
+/data/
+/logs/
+/state/
 
 # 回测产物一律不入库，只跟踪网页看板（单文件 HTML，离线可看）
 reports/*
