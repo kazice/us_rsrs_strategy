@@ -1,0 +1,64 @@
+{
+  "run_id": "44812033379",
+  "ts_utc": "2026-11-20T20:31:22+00:00",
+  "ts_et": "2026-11-20T15:31:22-05:00",
+  "asof": "2026-11-20",
+  "kind": "week",
+  "dry_run": false,
+  "git_sha": "9f27ff8d7b9a",
+  "pool": {
+    "size": 503,
+    "as_of": "2026-11-18"
+  },
+  "quotes": {
+    "count": 515,
+    "lag_min": 0.1
+  },
+  "data": {
+    "lag_days": 0,
+    "last_bar": "2026-11-19"
+  },
+  "mcap": {
+    "sources": {
+      "snapshot": 494,
+      "ws": 7,
+      "missing": 2
+    }
+  },
+  "regime": {
+    "bull": true,
+    "bear_ratio": 0.09523809523809523
+  },
+  "params": {
+    "rsrs_n": 20,
+    "rsrs_m": 40,
+    "stack": [
+      20,
+      60
+    ],
+    "slope_mas": [
+      20,
+      60
+    ],
+    "stack_slope": 5,
+    "above_ma": 50,
+    "cross": [
+      50,
+      200
+    ],
+    "adx_len": 14,
+    "adx_min": 20.0,
+    "regime_ma": 200,
+    "regime_window": 21,
+    "regime_bear_ratio": 0.5,
+    "bear_intersect_top": 3,
+    "bear_slope_window": 120,
+    "bear_min_score": 0.0,
+    "turn_cap": 0.2,
+    "turn_ratio_window": 120,
+    "turn_ratio_min_days": 60,
+    "turnma_top": 3,
+    "turnma_sectors": 3,
+    "min_mcap": 50000000000.0
+  }
+}

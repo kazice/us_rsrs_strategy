@@ -1,0 +1,24 @@
+{
+  "run_id": "44812033379",
+  "asof": "2026-11-20",
+  "kind": "week",
+  "dry_run": false,
+  "action": "继续空仓",
+  "detail": "本期无合格标的",
+  "pick": "",
+  "sector": "XLP",
+  "bull": true,
+  "pick_kind": "",
+  "price": null,
+  "holding": null,
+  "holding_return": null,
+  "turnover_median": 0.009303456438365727,
+  "notes": [
+    "牛市：SPY 过去 21 个交易日跌破 MA200 的占比 10%，判熊阈值 50%",
+    "1 只票 turn120 不足 60 天或为 0，不参与排序：VYLR",
+    "市值来源：快照 494 / 反推 7 / 缺失 2（快照 as of 2026-11-16）",
+    "市值不足 500 亿美元被剔除 279 只：A(480亿) ACGL(357亿) ADM(318亿) AEE(312亿) AES(107亿) AIG(416亿) AIZ(156亿) AKAM(123亿) ALB(94亿) ALGN(110亿) ALLE(155亿) AMCR(197亿) ...",
+    "2 只取不到市值（无报价或无股本），按回测口径保留：BRK-B BF-B"
+  ],
+  "notify_ok": true
+}
