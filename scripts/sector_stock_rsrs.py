@@ -460,7 +460,9 @@ def main() -> int:
         sec_of.update(dict(zip(smap["symbol"], smap["sector_etf"])))
         stocks = list(crsp_win)
         n_sic = int((smap["src"] == "sic").sum())
-        print(f"--data-source crsp：窗口内成分 {len(stocks)} 只（{n_sic} 只板块归属按 SIC 补齐）")
+        n_gics = int((smap["src"] == "gics").sum())
+        print(f"--data-source crsp：窗口内成分 {len(stocks)} 只"
+              f"（{n_gics} 只用手工 GICS 补，{n_sic} 只按 SIC 近似）")
     if args.pool_mode == "pit":
         pit_ev = load_sp500_change_events()
         pit_anchor = set(stocks)

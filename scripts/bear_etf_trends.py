@@ -22,15 +22,17 @@ COLORS = {
     "XLP": "#a78bfa", "XLE": "#f472b6", "XLI": "#22d3ee", "XLB": "#a3e635",
     "XLRE": "#fb923c", "XLU": "#38bdf8", "XLC": "#e879f9", "SPY": "#94a3b8",
 }
-START, END = "2021-11-13", "2026-10-26"
-REGIME_MA, REGIME_WIN, BEAR_RATIO = 120, 21, 0.5
+# 与定稿回测同口径：SPY vs MA200、21 日跌破占比 ≥50%、区间截至 CRSP 数据末端
+START, END = "2021-11-13", "2025-12-31"
+REGIME_MA, REGIME_WIN, BEAR_RATIO = 200, 21, 0.5
 RSRS_N, RSRS_M, SLOPE_WIN, INTERSECT = 20, 40, 120, 3
 
 
 def latest_out() -> Path:
+    """优先用 CRSP 定稿产出；没有就退回最新的任何一套。"""
     base = ROOT / "reports" / "etf"
     cands = [p for p in base.iterdir()
-             if p.is_dir() and (p / "holds.csv").exists() and fnmatch.fnmatch(p.name, "*fullbspy")]
+             if p.is_dir() and (p / "holds.csv").exists() and fnmatch.fnmatch(p.name, "*crsp*")]
     if not cands:
         cands = [p for p in base.iterdir() if p.is_dir() and (p / "holds.csv").exists()]
     return max(cands, key=lambda p: p.stat().st_mtime)

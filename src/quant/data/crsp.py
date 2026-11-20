@@ -27,6 +27,27 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[3]
 CRSP_DIR = ROOT / "data" / "curated" / "crsp_sp500"
 
+# 手工 GICS 归属：SPDR 快照里没有、但 SIC 会分错的历史成分股。
+# 这些名字的 GICS 板块是稳定的公开信息，逐只写死比按 SIC 猜更可靠；
+# 抽样核对时发现 SIC 把 CTVA 分到 XLP（应 XLB）、WBD/PARA 分到 XLI（应 XLC）。
+SECTOR_OVERRIDE: dict[str, str] = {
+    # 材料
+    "CTVA": "XLB",
+    # 医疗
+    "OGN": "XLV", "CTLT": "XLV", "KVUE": "XLV", "WBA": "XLV",
+    # 房地产（SIC 6798 会把 REIT 全分进金融）
+    "VNO": "XLRE", "DRE": "XLRE", "EQR": "XLRE", "AVB": "XLRE",
+    # 通信服务（媒体 / 电信 / 互动平台 / 广告）
+    "PARA": "XLC", "PSKY": "XLC", "DISCA": "XLC", "DISCK": "XLC", "DISH": "XLC",
+    "WBD": "XLC", "LUMN": "XLC", "MTCH": "XLC", "NLSN": "XLC", "IPG": "XLC",
+    "TTD": "XLC", "TWTR": "XLC",
+    # 信息技术（软件 / 网络设备）
+    "CTXS": "XLK", "ATVI": "XLK", "EA": "XLK", "ANSS": "XLK", "PAYC": "XLK",
+    "EPAM": "XLK", "CERN": "XLK", "DAY": "XLK", "DXC": "XLK", "JNPR": "XLK",
+    # 可选消费（家电 / 零售）
+    "WHR": "XLY", "POOL": "XLY", "LKQ": "XLY",
+}
+
 # SIC 大类 → SPDR 板块 ETF。只用于 CRSP 独有的历史成分股（本地 holdings 快照里没有的票），
 # 命中不了的一律归 XLI（工业），并在 `sector_map` 的返回里留来源标记，便于排查。
 SIC_TO_ETF: list[tuple[int, int, str]] = [
@@ -143,6 +164,9 @@ def sector_map(symbols: list[str]) -> pd.DataFrame:
     for s in symbols:
         if s in known:
             rows.append((s, known[s], "holdings"))
+            continue
+        if s in SECTOR_OVERRIDE:
+            rows.append((s, SECTOR_OVERRIDE[s], "gics"))
             continue
         code = sic.get(s)
         etf = None
