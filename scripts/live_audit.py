@@ -36,11 +36,14 @@ REASON_TXT = {
     "small_mcap": "市值不达标",
     "turn_cap": "换手率超上限",
     "no_turnover": "无 20 日换手率",
+    "no_turn120": "无 120 日换手率（不足 60 天）",
     "no_quote": "无当日报价",
     "no_local_data": "本地无行情",
-    "not_in_top3": "不在板块换手率前 3",
-    "stack_fail": "均线非多头排列",
+    "not_in_top3": "不在板块排序分前 3",
+    "gate_fail": "未过趋势五闸",
     "not_selected": "合格但被更靠前的板块抢先",
+    "bear_regime": "熊市：只做板块 ETF，个股不参与",
+    "selected_bear": "熊市 ETF 入选",
 }
 
 
@@ -123,18 +126,21 @@ def cmd_date(day: str) -> int:
         if cfile.exists():
             c = pd.read_csv(cfile, encoding="utf-8-sig")
             print(f"\n候选池 {len(c)} 只，入选 1 只。板块前 3 的下探过程：")
-            top = c[c["in_top3"] == True].sort_values(["sector_rank", "turnover20"],
+            by = "score" if "score" in c.columns else "turnover20"
+            top = c[c["in_top3"] == True].sort_values(["sector_rank", by],
                                                       ascending=[True, False])
             if len(top):
                 show = pd.DataFrame({
                     "板块": top["sector"],
                     "排名": top["sector_rank"].astype("Int64"),
                     "代码": top["symbol"],
+                    "排序分": top[by].map(
+                        lambda v: f"{v:.4f}" if pd.notna(v) else "-"),
                     "换手": top["turnover20"].map(
                         lambda v: f"{v:.2%}" if pd.notna(v) else "-"),
                     "市值(亿)": top["mcap"].map(
                         lambda v: f"{v / 1e8:,.0f}" if pd.notna(v) else "-"),
-                    "多头": top["stack_ok"],
+                    "五闸": top["gate_ok"] if "gate_ok" in top.columns else "",
                     "结论": top["reason"].fillna("").map(
                         lambda r: REASON_TXT.get(str(r), str(r))),
                 })
@@ -177,9 +183,15 @@ def cmd_why(symbol: str, day: str | None) -> int:
         if cap != "未知" and src:
             cap += f"（来源 {src}）"
         rank = f"{int(r['sector_rank'])}" if pd.notna(r["sector_rank"]) else "-"
-        print(f"  {sym}  板块={r['sector']}  价={r['price']}  20日均换手={to}  市值={cap}")
-        print(f"  均线 MA10/20/50 = {r['ma10']:.2f} / {r['ma20']:.2f} / {r['ma50']:.2f}"
-              f"  多头排列={r['stack_ok']}")
+        t120 = (f"{float(r['turnover120']):.4f}"
+                if "turnover120" in r.index and pd.notna(r.get("turnover120")) else "无")
+        print(f"  {sym}  板块={r['sector']}  价={r['price']}  20日均换手={to}  "
+              f"120日均换手={t120}  市值={cap}")
+        if "gate_ok" in r.index:
+            print(f"  趋势五闸 MA20={r.get('ma20')} 斜率={r.get('s20')} "
+                  f"MA60={r.get('ma60')} 斜率={r.get('s60')} MA50={r.get('ma50')} "
+                  f"MA200={r.get('ma200')} ADX={r.get('adx')} → 通过={r['gate_ok']}"
+                  f"（{r.get('gate_why') or '-'}）")
         print(f"  板块排名={rank}  进入前3={r['in_top3']}  最终入选={r['selected']}")
         print(f"  结论：{REASON_TXT.get(str(r['reason']), r['reason'])}")
         if str(r["reason"]) == "small_mcap" and pd.notna(r["mcap"]):

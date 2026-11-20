@@ -1,19 +1,27 @@
 # 模拟盘（GitHub Actions + pushplus）
 
-定稿策略：板块 → 个股双层 RSRS，板块内按 20 日均换手率取前 3、要求多头排列，
-最多下探 3 个板块；月末最后一个交易日**收盘前 30 分钟**决策，单票满仓、不设止损。
+定稿策略：板块 → 个股双层 RSRS。牛市里板块内按 `turn20²/turn120` 取前 3，要求 strong 趋势五闸
+（MA20>MA60、两条均线 5 日斜率为正、收盘>MA50、MA50>MA200、ADX(14)>20），最多下探 3 个板块；
+熊市完全不碰个股，只买「板块 RSRS 前 3 ∩ 120 日加权斜率前 3」里最强的那只 ETF，RSRS ≤0 就空仓。
+月末最后一个交易日**收盘前 30 分钟**决策，单票满仓、不设止损；调仓日空仓时，牛市在其后每个
+交易日补选一次，直到下一个调仓日。
 
-定稿参数（与回测产出一一对应）：
+定稿参数（与回测产出一一对应，`signal.py` 的常量必须和这份命令逐项对齐）：
 
 ```
 --n 20 --m 40 --pick turnma --turnma-top 3 --turnma-sectors 3
---trend-mode ma_stack --stack-order desc
---turn-shares ws --turn-cap 0.20 --turn-tail 0.48
---pool-mode pit --min-mcap 500
+--trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60
+--trend-above 50 --trend-cross 50,200 --adx-min 20
+--turn-shares ws --turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
+--min-mcap 500
+--regime-ma 200 --regime-window 21 --bear-etf-only --bear-rank both
+--bear-intersect-top 3 --bear-slope-window 120 --bear-min-score 0
 ```
 
-产物目录 `reports/etf/rsrs_stock_n20_m40_top1_turnma_ma_stack_desc_turnws_cap20_tail48_ppit_mc500_3y_mc500/`
-（2023-11 ~ 2026-10：累计 +1616.1%、夏普 3.024、最大回撤 −37.2%，stats.csv 日度净值口径）。
+回测产物目录
+`reports/etf/rsrs_stock_n20_m40_top1_turnma_strong_20-60_sl5_slma20-60_a50_x50-200_adx20_turnws_tratio_bref_cap20_tail48_ppit_mc500_reg200_bearnofilter_rw21_betfonly_bmin0_brankBoth3x120_merged/`
+（2021-11 ~ 2026-10：`--pool-mode pit` 累计 **+4995.8%**、年化 122.3%、夏普 2.770、回撤 −36.93%；
+snapshot 池口径 +2604.7%。差 13% 左右是数据版本差，见 `docs/PROGRESS.md` 2026-11-20 条）。
 
 **市值门槛 500 亿美元是数据清洗口径，不是调参**：小盘票的换手率分母（股本）小、噪声大，
 且天然高换手，不设门槛会让「按换手率排序」系统性偏向指数尾部（NCLH 市值 65~100 亿美元、
@@ -27,15 +35,36 @@
 | 时间（ET） | 谁 | 动作 |
 |---|---|---|
 | 收盘后 +8 分钟 | `scripts.paper_close_update` | 补当天行情（yahoo）→ 把当天换手率写进面板 → 提交 data 分支 |
-| 收盘前 30 分钟 | `scripts.live_signal` | 判断今天是不是调仓日/周末 → 拉实时报价 → 算当期信号 → pushplus 推送 → 写账本 |
+| 收盘前 30 分钟 | `scripts.live_signal` | 判断今天该干什么（调仓/周报/补选/都不做）→ 拉实时报价 → 算当期信号 → pushplus 推送 → 写账本 |
 | 其它时间 | 同上 | 取当日收盘时间后不在窗口内，`exit 0`，什么都不做 |
 
-推送只在两种日子发出：
+**每个交易日都会在收盘前 30 分钟算一次**（`scripts/cron_sync.py` 的 `day_triggers` 改成所有
+交易日都排 signal）。原因只有一个：牛市补选要求在调仓日空仓后逐日重挑，不是推送日就不算，
+就会永远等不到补选。非推送日绝大多数只是空跑 `exit 0`，不推送、不记账。
+
+推送在这些日子发出：
 
 - **调仓日**（月末最后一个交易日）：动作 + 板块 + 买入参考价 + 候选表 + 上期持仓收益；
-- **周内最后交易日**：持仓、建仓价、持有期收益、累计净值、下个调仓日。
+- **周内最后交易日**：持仓、建仓价、持有期收益、累计净值、下个调仓日；
+- **补选成交日**（牛市、且上次调仓日空仓）：只在真的挑到票的那天推一条，等待日不打扰。
 
-两者撞在同一天时只推调仓那条。
+调仓日与周报撞在同一天时只推调仓那条。补选日若恰好也是周内最后交易日，推补选那条
+（更紧急，且筛选表的内容一样全）。
+
+## 一之一、牛熊与补选（与回测 `--regime-*` / `--bull-refill` 一一对应）
+
+- **判熊**：SPY 收盘价与 MA200 比较，取过去 **21 个交易日跌破占比**，≥50% 判熊。单日跌破
+  不翻转（2026-03 就是单日跌破被判熊，把后面 +54% 的一期让给了 ETF）。统计量预热不足时
+  按牛市处理。
+- **熊市只做 ETF**：不选个股，买「板块 RSRS 前 3 ∩ 120 日加权斜率前 3」交集里 RSRS 最强的
+  那只 SPDR 板块 ETF；交集为空、或最强板块 RSRS ≤0 → 当期空仓。ETF 代码直接记进账本
+  （`positions.json` 的 `symbol` 就是 `XLK` 这种），与个股走同一套持仓/收益计算。
+- **牛市补选**：调仓日 9 个候选全不过闸 → 账本写 `refill.json`（含 `until` = 下一个调仓日、
+  `bull` = 冻结的分支）。其后每个交易日重算一次，命中就按当日价买入并关闭窗口；到
+  `until` 仍没命中就整段空仓。**分支冻结**：补选期间即使 SPY 已跌破 MA200，也继续按牛市
+  链路选股——回测就是在信号日判定的牛市里逐日重挑的，中途切换分支会凭空多出一笔 ETF 交易。
+- **不补选的两种情形**：熊市空仓不补（回测的 `--bear-refill` 没在定稿命令里）；调仓日
+  有票就更不补。
 
 ## 二、为什么时间不写死
 
@@ -110,8 +139,13 @@ python -m scripts.live_signal --force --dry-run
 python -m scripts.paper_close_update
 ```
 
-GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/rebalance/week）与
-`dry_run`。
+```bash
+# 手动跑一次牛市补选（补选窗口外跑会直接 noop）
+python -m scripts.live_signal --kind refill --dry-run
+```
+
+GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/rebalance/week/refill）
+与 `dry_run`。
 
 ## 五、候选池与标普 500 的调入调出
 
@@ -151,9 +185,12 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 | 买入价 | 信号日 `adj_close` | 15:30 时点现价 | 推送里写明「参考价」，不假装是成交价 |
 | RSRS 的 high/low | 完整日振幅 | 缺收盘前 30 分钟 | 已知偏差，排序边界附近可能翻转 |
 | 换手率 | 19 天完整 + 当日 ×0.48 | 19 天完整 + 当日**累计值** | 实盘**不再乘 0.48**（报价本身就是截至此刻），乘两遍会重复折价 |
-| 换手率数据源 | westock 日 K（成交量/总股本） | 腾讯报价换手率字段 | 同源同口径；新浪按「成交量/市值反推股本」做校验与兜底 |
+| 换手率排序 | `turn20²/turn120`（turn120 至少 60 天） | 同一公式，turn120 用 `turnover.mean_n(window=120, min_days=60)` | turn120 有效天数不够的票**不参与排序**（不是当 0） |
+| 趋势闸 | `--trend-mode strong` 五闸全 AND | 同一套（`signal._gate_panels` / `_gate`），面板向量化 | 已用 2026-05~10 五个调仓日 + 2022 熊市四个调仓日逐期对齐回测持仓 |
+| 牛熊 | SPY vs MA200，21 日跌破占比 ≥50% 判熊 | 同一口径 | 补选期间分支冻结在开启日，见「一之一」 |
+| 补选 | `--bull-refill` 逐日重挑 | `refill.json` + 每个交易日算一次 | 等待日不推送；分支冻结，避免中途翻熊乱买 ETF |
 | 成分股 | 2026-11-11 静态快照（492 只有行情） | 每日刷新 + 变更日志，代码归一 | live 比回测多 `BRK-B`/`BF-B`，两边口径不同，不可直接对曲线 |
-| 止损 | 不设 | 不设 | 单票满仓，回测最大回撤 −37.2% |
+| 止损 | 不设 | 不设 | 单票满仓，回测最大回撤 −36.9%（pit 口径） |
 | 市值门槛 | ≥500 亿美元，市值 = 未复权价 × 反推股本（全样本中位数） | 同一阈值，市值 = 未复权价 × **当日真实股本**（快照 → 反推 5 日 → SEC 三级兜底，逐票留来源） | 实盘不再用 3 年中位数（它会把拆股/回购后的股本算错）。503 只实测 500 亿门槛附近 **14 只**判定翻转；引用历史收益时要说明 |
 
 ## 七、已知风险（不是 bug，是取舍）
@@ -174,9 +211,10 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 |---|---|
 | `src/quant/live/calendar.py` | 交易日历、当日收盘时间（联网+内置+人工覆盖）、调仓/周末判定、执行窗口 |
 | `src/quant/live/quotes.py` | 腾讯/新浪批量报价，价格、盘中高低、累计成交量、换手率、时间戳 |
-| `src/quant/live/turnover.py` | 历史 19 天（ws 面板）+ 当天（报价）合成 20 日均换手率 |
+| `src/quant/live/turnover.py` | 历史 19 天（ws 面板）+ 当天（报价）合成均换手率；`build` = turn20，`mean_n(window=120, min_days=60)` = turn120 |
 | `src/quant/live/pool.py` | 候选池：成分股快照刷新、调入调出变更日志、代码归一、新票识别 |
-| `src/quant/live/signal.py` | 当期信号：板块 RSRS → 市值/换手率过滤 → 换手率 top3 → 多头排列 → 下探 |
+| `src/quant/live/signal.py` | 当期信号：牛熊判定 → 熊市 ETF / 牛市「板块 RSRS → turn20²/turn120 前 3 → strong 五闸 → 下探」 |
+| `src/quant/live/books.py` | 账本；`refill.json` 记录牛市补选窗口（`open/since/until/bull`） |
 | `src/quant/live/mcap.py` | 市值门槛：未复权价 × 当日真实股本（Nasdaq 日快照 → 5 日换手率反推 → SEC 申报兜底） |
 | `src/quant/live/journal.py` | 运行流水与决策快照（用法见 `docs/LIVE_LOG.md`） |
 | `src/quant/live/books.py` | 持仓、流水、已推送标记（幂等） |

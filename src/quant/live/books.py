@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 POSITIONS = "positions.json"
 PUSHED = "pushed.json"
 LEDGER = "ledger.csv"
+REFILL = "refill.json"
 
 LEDGER_COLUMNS = ["date", "kind", "action", "from_symbol", "to_symbol",
                   "sector", "price", "adj", "ret_since_entry", "nav", "note"]
@@ -112,6 +113,29 @@ def mark_pushed(kind: str, day: str, extra: dict | None = None) -> None:
     payload.update(extra or {})
     pushed[kind] = payload
     save_pushed(pushed)
+
+
+def load_refill() -> dict:
+    """牛市补选的等待状态：``{open, since, until, bull}``。
+
+    只在「调仓日当天一只都没通过 + 牛市」时打开（回测 ``--bull-refill`` 的触发条件），
+    补选成交、或走到下一个调仓日时关闭。熊市不会打开。
+
+    ``bull`` 冻结的是**开启那天**的分支：回测的补选在信号日判定的牛市里逐日重挑，
+    即使补选当天 SPY 已跌破 MA200 也不改分支。
+    """
+    return _read_json(state_dir() / REFILL, {"open": False})
+
+
+def set_refill(since: str, until: str, bull: bool = True) -> None:
+    _write_json(state_dir() / REFILL,
+                {"open": True, "since": since, "until": until, "bull": bool(bull)})
+
+
+def clear_refill(reason: str = "") -> None:
+    if reason:
+        log.info("关闭牛市补选：%s", reason)
+    _write_json(state_dir() / REFILL, {"open": False})
 
 
 def plan_action(pos: Position, target_symbol: str) -> tuple[str, str]:

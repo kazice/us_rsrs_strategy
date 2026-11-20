@@ -44,12 +44,17 @@ def cron_at(t: dt.datetime) -> str:
 
 
 def day_triggers(d: dt.date) -> list[tuple[str, dt.datetime]]:
-    """某个 ET 日期的触发点：推送日有 signal，所有交易日有 data。"""
+    """某个 ET 日期的触发点：**每个交易日**都在收盘前 30 分钟叫醒一次 signal，data 收盘后跑。
+
+    为什么 signal 不再只挂在推送日：回测的 ``--bull-refill`` 会在「调仓日空仓」后逐日重挑，
+    实盘只能在每个交易日都算一次才知道今天有没有补选信号。非推送日由 ``live_signal``
+    自己判断（无持仓、无补选窗口就直接 exit 0），多出来的运行只是空跑。
+    """
     if not calendar.is_trading_day(d):
         return []
     occ = calendar.occasion_for(d)
     out: list[tuple[str, dt.datetime]] = []
-    if occ.should_push and occ.trigger_utc is not None:
+    if occ.trigger_utc is not None:
         out.append(("signal", occ.trigger_utc))
     if occ.close_et is not None:
         close = dt.datetime.combine(d, occ.close_et, tzinfo=calendar.ET).astimezone(UTC)
