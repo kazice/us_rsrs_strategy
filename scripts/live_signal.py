@@ -21,6 +21,7 @@ import datetime as dt
 import logging
 import sys
 
+import numpy as np
 import pandas as pd
 
 from quant.live import books, calendar, journal, notify, pool, quotes, signal as signal_mod
@@ -133,8 +134,8 @@ def render_rebalance(sig, action: str, action_detail: str, pos: books.Position,
         lines.append(f"**上期持仓**：{pos.symbol}（{pos.sector}，{pos.entry_date} 建仓 "
                      f"@ ${pos.entry_price:.2f}），持有期收益 {_fmt_pct(holding_ret)}")
 
-    # 与周报共用同一段「本期筛选」：板块 RSRS 前三、换手 TOP3 的 MA10/20/50、各层数量。
-    # 调仓那天才是真成交，看不到均线具体值说不过去。
+    # 与周报共用同一段「本期筛选」：牛熊 + 板块前三 + 排序分前 3 的趋势五闸 + 各层数量。
+    # 调仓那天才是真成交，看不到每道闸的具体数值说不过去。
     lines += _screen_lines(sig, decided=True)
 
     lines += _pool_lines(pctx)
@@ -155,13 +156,19 @@ def render_rebalance(sig, action: str, action_detail: str, pos: books.Position,
     return title, "\n".join(lines)
 
 
-def _ma_txt(mas: dict, w: int) -> str:
-    v = mas.get(w)
-    return "—" if v is None or v != v else f"{v:.2f}"
+def _num(v, digits: int = 2) -> str:
+    return "—" if v is None or not np.isfinite(v) else f"{v:.{digits}f}"
+
+
+def _regime_line(sig) -> str:
+    ratio = "" if not np.isfinite(sig.bear_ratio) else f"，21 日跌破占比 {sig.bear_ratio:.0%}"
+    if sig.bull:
+        return f"- 牛熊：**牛市**（SPY vs MA200{ratio}）→ 走个股链路"
+    return f"- 牛熊：**熊市**（SPY vs MA200{ratio}）→ 只做板块 ETF，不碰个股"
 
 
 def _screen_lines(sig, decided: bool = False) -> list[str]:
-    """本期筛选明细：结论 + 板块 RSRS + 换手 TOP3 的均线 + 各层数量。
+    """本期筛选明细：牛熊 + 结论 + 板块排名 + 趋势五闸每一项的取值 + 各层数量。
 
     周报原先只报持仓，空仓时就两行，读的人分不清「没有合格标的」和「还没建仓」，
     也看不到候选究竟卡在哪一步。这里把每一步的具体数字摊开。
@@ -169,48 +176,77 @@ def _screen_lines(sig, decided: bool = False) -> list[str]:
     ``decided=True`` 用在调仓推送：那天是真的要下单，「若今日为调仓日」的假设语气
     要换成「买入」；其余内容与周报完全一致，两种推送看同一张表。
     """
-    out = ["", "**本期筛选**"]
+    out = ["", "**本期筛选**", _regime_line(sig)]
 
     if sig.pick:
-        rank = next((c.sector_rank for c in sig.candidates if c.symbol == sig.pick), 1)
-        rsrs = float(sig.sector_scores.get(sig.sector, float("nan")))
         lead = "结论：买入" if decided else "结论：若当日为调仓日，买入"
-        out.append(f"- {lead} **{sig.pick}**（{sig.sector}）满足全部条件\u2014\u2014"
-                   f"板块 RSRS 第 {rank}（{rsrs:.2f}），在换手 TOP3 内且 MA10>MA20>MA50；"
-                   f"参考价 ${sig.price:.2f}（盘中时点价，非收盘价）")
+        if sig.pick_kind == "etf":
+            rsrs = float(sig.sector_scores.get(sig.sector, float("nan")))
+            out.append(f"- {lead} **{sig.pick}**（板块 ETF，{sig.sector}）\u2014\u2014"
+                       f"熊市双榜交集第一名，RSRS {rsrs:.2f}；"
+                       f"参考价 ${sig.price:.2f}（盘中时点价，非收盘价）")
+        else:
+            rank = next((c.sector_rank for c in sig.candidates if c.symbol == sig.pick), 1)
+            sc = next((c.score for c in sig.candidates if c.symbol == sig.pick), float("nan"))
+            rsrs = float(sig.sector_scores.get(sig.sector, float("nan")))
+            out.append(f"- {lead} **{sig.pick}**（{sig.sector}）满足全部条件\u2014\u2014"
+                       f"板块 RSRS 第 {rank}（{rsrs:.2f}），排序分 turn20\u00b2/turn120 = {sc:.4f}，"
+                       f"过趋势五闸；参考价 ${sig.price:.2f}（盘中时点价，非收盘价）")
     else:
         tail = "，本次调仓空仓" if decided else ""
-        out.append("- 结论：前三个板块 \u00d7 换手 TOP3 全部不满足 MA10>MA20>MA50，"
-                   f"本期无合格标的{tail}")
+        if sig.bull:
+            out.append("- 结论：前三个板块 \u00d7 排序分前 3 全部未过趋势五闸，"
+                       f"当期无合格标的{tail}（牛市当天起逐日补选，见下方说明）")
+        else:
+            out.append(f"- 结论：熊市双榜（RSRS 前 3 \u2229 120 日斜率前 3）无合格标的，"
+                       f"当期空仓{tail}")
 
-    top = signal_mod.top_sectors(sig)
-    out.append("- 板块 RSRS 前三：" + " / ".join(f"{s} {v:.2f}" for s, v in top))
+    if sig.bull:
+        top = signal_mod.top_sectors(sig)
+        out.append("- 板块 RSRS 前三：" + " / ".join(f"{s} {v:.2f}" for s, v in top))
+    else:
+        bs = sig.bear_scores if sig.bear_scores is not None else pd.Series(dtype="float64")
+        if len(bs):
+            out.append("- 熊市双榜交集（RSRS \u2229 120 日斜率）："
+                       + " / ".join(f"{s} {v:.2f}" for s, v in bs.items()))
+        else:
+            out.append("- 熊市双榜交集为空：RSRS 前 3 与 120 日加权斜率前 3 没有共同板块")
 
     if sig.candidates:
-        out += ["", "| 板块序 | 板块 | 代码 | 20日均换手 | MA10 | MA20 | MA50 | 多头排列 |",
-                "|---|---|---|---|---|---|---|---|"]
+        out += ["", "| 板块序 | 板块 | 代码 | 排序分 | turn20 | turn120 | MA20 | 20斜率 "
+                    "| MA60 | 60斜率 | MA50 | MA200 | ADX | 五闸 |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for c in sig.candidates[:9]:
             mark = MARK_OK if c.ok else MARK_NO
-            out.append(f"| {c.sector_rank} | {c.sector} | {c.symbol} | {c.turnover:.2%} | "
-                       f"{_ma_txt(c.ma, 10)} | {_ma_txt(c.ma, 20)} | {_ma_txt(c.ma, 50)} | "
-                       f"{mark} |")
+            g = c.gate
+            out.append(
+                f"| {c.sector_rank} | {c.sector} | {c.symbol} | {c.score:.4f} | "
+                f"{c.turnover:.2%} | {_num(c.turnover120, 4)} | "
+                f"{_num(g.get('ma20'))} | {_num(g.get('s20'), 3)} | "
+                f"{_num(g.get('ma60'))} | {_num(g.get('s60'), 3)} | "
+                f"{_num(g.get('ma50'))} | {_num(g.get('ma200'))} | "
+                f"{_num(g.get('adx'), 1)} | {mark} |")
 
     tbl = sig.pool_table
     if len(tbl):
         cap_ok = tbl["mcap_ok"] == True                    # noqa: E712  列里是 object 布尔
         turn_ok = tbl["turn_ok"] == True                   # noqa: E712
-        stack_ok = tbl["stack_ok"] == True                 # noqa: E712
+        gate_ok = tbl["gate_ok"] == True                   # noqa: E712
         both = cap_ok & turn_ok
         out.append("")
         out.append(f"- 数量：候选池 {len(tbl)} 只 \u2192 市值+换手双合规 {int(both.sum())} 只 "
-                   f"\u2192 MA 多头排列 {int((both & stack_ok).sum())} 只 "
+                   f"\u2192 过趋势五闸 {int((both & gate_ok).sum())} 只 "
                    f"\u2192 进板块 TOP3 {int((tbl['in_top3'] == True).sum())} 只 "  # noqa: E712
                    f"\u2192 选中 {int((tbl['selected'] == True).sum())} 只")  # noqa: E712
-        out.append(f"- 参考：全池 MA 多头排列 {int(stack_ok.sum())} 只"
+        out.append(f"- 参考：全池过趋势五闸 {int(gate_ok.sum())} 只"
                    f"（含未过市值/换手门槛的）")
-        out.append("- 口径：先按板块 RSRS 取前 3 个板块，"
-                   "每个板块内按 20 日均换手降序取前 3 只，"
-                   "只在这最多 9 只里判 MA10>MA20>MA50，命中即止")
+        out.append("- 口径：先按板块 RSRS 取前 3 个板块，每个板块内按 turn20\u00b2/turn120 "
+                   "降序取前 3 只，只在这最多 9 只里判「MA20>MA60、两条均线 5 日斜率为正、"
+                   "收盘>MA50、MA50>MA200、ADX(14)>20」，命中即止")
+        fails = tbl[tbl["reason"] == "gate_fail"] if "reason" in tbl.columns else tbl.iloc[0:0]
+        if len(fails):
+            out.append("- 未过闸示例：" + "；".join(
+                f"{r.symbol}（{r.gate_why}）" for r in fails.head(3).itertuples()))
     return out
 
 
@@ -220,7 +256,12 @@ def render_week(sig, pos: books.Position, holding_ret: float | None, ctx: dict,
     title = f"[模拟盘] {sig.asof:%m-%d} 周报"
     body = [f"## {sig.asof:%Y-%m-%d} 周报", ""]
     if pos.is_empty():
-        body.append("**当前空仓**：账本尚无持仓 \u2014\u2014 本策略只在月末最后交易日建仓，周报只报不平账。")
+        rf = books.load_refill()
+        body.append("**当前空仓**：账本尚无持仓 \u2014\u2014 调仓日建仓（牛市空仓后逐日补选），"
+                    "周报只报不平账。")
+        if rf.get("open"):
+            body.append(f"- 牛市补选中：自 {rf.get('since', '?')} 起逐日重挑，"
+                        f"窗口到 {rf.get('until', '?')}")
         body.append(f"- 下个调仓日：{nxt:%Y-%m-%d}（收盘前 30 分钟）")
         if sig.pick:
             body.append(f"- 若今日就是调仓日，会买入：{sig.pick}（{sig.sector}）")
@@ -240,11 +281,40 @@ def render_week(sig, pos: books.Position, holding_ret: float | None, ctx: dict,
     return title, "\n".join(body)
 
 
+def render_refill(sig, action: str, action_detail: str, pos: books.Position, ctx: dict,
+                  pctx: dict, rf: dict) -> tuple[str, str]:
+    """牛市的「补选成交」推送：和调仓推送同一张筛选表，但把触发条件写清楚。"""
+    title = f"[模拟盘] {sig.asof:%m-%d} 牛市补选：{action_detail}"
+    lines = [
+        f"## {sig.asof:%Y-%m-%d} 牛市补选",
+        "",
+        f"**动作**：{action} —— {action_detail}",
+        f"**触发**：{rf.get('since', '?')} 调仓日一只都没过关，牛市里逐日重挑；"
+        f"窗口到下一个调仓日 {rf.get('until', '?')} 为止（仍找不到就整段空仓）",
+        f"**板块**：{sig.sector}（RSRS {sig.sector_scores.get(sig.sector, float('nan')):.2f}）",
+    ]
+    lines += _screen_lines(sig, decided=True)
+    lines += _pool_lines(pctx)
+
+    lines += ["", "---", "**数据状态**"]
+    lines.append(f"- 报价滞后 {ctx['lag']}")
+    lines.append(f"- 换手率覆盖 {ctx['turn_cov']}，全市场中位 {ctx['turn_med']}")
+    for n in sig.notes:
+        lines.append(f"- {n}")
+    for w in ctx.get("warnings") or []:
+        lines.append(f"- ⚠ {w}")
+
+    lines += ["", "**口径提醒**：补选对应回测的 ``--bull-refill``——只在「调仓日空仓」时才逐日"
+                  "重挑，不追已经走完的行情；本策略不设止损、单票满仓，执行价以你的盘口为准。"]
+    return title, "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟盘信号（收盘前 30 分钟）")
     ap.add_argument("--now", default="", help="模拟当前时刻（默认取系统时钟），时区缺省按 ET")
-    ap.add_argument("--kind", default="auto", choices=["auto", "rebalance", "week"],
-                    help="auto = 按日历判断；rebalance/week = 强制按该类推送")
+    ap.add_argument("--kind", default="auto", choices=["auto", "rebalance", "week", "refill"],
+                    help="auto = 按日历判断；rebalance/week = 强制按该类推送；"
+                         "refill = 牛市补选（调仓日空仓后逐日重挑）")
     ap.add_argument("--force", action="store_true", help="无视执行窗口与幂等键")
     ap.add_argument("--dry-run", action="store_true", help="只打印不推送、不记账")
     ap.add_argument("--no-journal", action="store_true",
@@ -264,6 +334,9 @@ def main() -> int:
     today_et = now.astimezone(calendar.ET).date()
     occ = calendar.occasion_for(today_et)
     kind = occ.kind if args.kind == "auto" else args.kind
+    if kind == "none" and args.kind == "auto" and books.load_refill().get("open"):
+        # 非推送日也要看一眼：牛市调仓日空仓后，每个交易日都得重挑一次（回测 --bull-refill）。
+        kind = "refill"
 
     # 日志对象先建：后面任何一条出口（含异常）都要留一行流水，
     # 否则「那天为什么没收到信号」只能去翻 90 天就过期的 Actions log。
@@ -358,8 +431,12 @@ def _run(args, j, now, today_et, occ, kind) -> int:
                           f"不足以支撑收盘前 30 分钟的决策，中止且不推送")
 
     # --- 信号 ---
+    # 补选窗口内沿用「调仓日定下的分支」：回测 --bull-refill 是在信号日判定的牛市里逐日重挑，
+    # 中途 SPY 跌破 MA200 也不改分支（否则补选会突然跳到熊市 ETF 上）。
+    rf = books.load_refill() if kind == "refill" else {"open": False}
+    regime = bool(rf.get("bull", True)) if kind == "refill" else None
     try:
-        sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes)
+        sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes, regime=regime)
     except SystemExit as exc:      # 报价还是上一交易日的快照、行情历史不够等硬性条件
         return _abort(j, args, "abort", "compute_abort", str(exc))
     j.pick, j.sector = sig.pick, sig.sector
@@ -394,6 +471,24 @@ def _run(args, j, now, today_et, occ, kind) -> int:
     if kind == "week" and action == "换仓":
         action, detail = "继续持有", f"继续持有 {pos.symbol}（下周才换）"
 
+    # --- 牛市补选（对应回测 --bull-refill）---
+    # 只在「调仓日空仓 + 牛市」时打开，逐日重挑到下一个调仓日为止。等待日不推送、不记账，
+    # 只在真的挑到票的那天推一条——与回测「命中日才买入」的语义一致。
+    rf = rf if kind == "refill" else books.load_refill()
+    if kind == "refill":
+        if not pos.is_empty():
+            books.clear_refill("已有持仓，补选无意义")
+            return j.finish(0, "noop", "refill_has_position")
+        if not rf.get("open"):
+            return j.finish(0, "noop", "refill_closed")
+        until = str(rf.get("until") or "")
+        if until and day > until:
+            books.clear_refill(f"已到下一个调仓日 {until}")
+            return j.finish(0, "noop", "refill_expired")
+        if not sig.pick:
+            print("补选窗口内今天仍无合格标的，不动、不推送。")
+            return j.finish(0, "noop", "refill_wait")
+
     # --- 候选池状态与指数调整 ---
     pctx = _pool_context(sig, pos, today_et)
 
@@ -406,6 +501,8 @@ def _run(args, j, now, today_et, occ, kind) -> int:
 
     if kind == "rebalance":
         title, content = render_rebalance(sig, action, detail, pos, holding_ret, ctx, pctx)
+    elif kind == "refill":
+        title, content = render_refill(sig, action, detail, pos, ctx, pctx, rf)
     else:
         title, content = render_week(sig, pos, holding_ret, ctx, pctx)
 
@@ -435,11 +532,19 @@ def _run(args, j, now, today_et, occ, kind) -> int:
 
     books.mark_pushed(kind, day, {"symbol": sig.pick, "sector": sig.sector,
                                   "action": action})
-    if kind == "rebalance":
-        # 只有调仓日滚动净值；周报只报不平账，避免同一段收益被记两次
+    if kind in ("rebalance", "refill"):
+        # 只有调仓日与补选成交滚动净值；周报只报不平账，避免同一段收益被记两次
         books.record(pos, day=day, kind=kind, action=action, signal=sig,
                      holding_return=holding_ret, note=detail)
         print(f"账本已更新：{detail}，累计净值 {pos.nav:.4f}")
+        nxt_reb = _next_rebalance(today_et)
+        if sig.pick:
+            books.clear_refill("补选成交" if kind == "refill" else "本期已建仓")
+        elif sig.bull:
+            books.set_refill(since=day, until=nxt_reb.isoformat(), bull=bool(sig.bull))
+            print(f"本期空仓 → 打开牛市补选，逐日重挑到 {nxt_reb:%Y-%m-%d}")
+        else:
+            books.clear_refill("熊市空仓，不做补选")
     else:
         print(f"账本不变（{action}）。")
     return j.finish(0, "ok", detail)

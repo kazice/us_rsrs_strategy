@@ -72,10 +72,45 @@ class TurnoverResult:
     asof: pd.Timestamp | None = None
 
 
+def _today_from_panel(today_panel: pd.Series, symbols: list[str]) -> pd.Series:
+    """重放专用：asof 当天的换手率直接取面板值（已是小数，与报价除以 100 同口径）。
+
+    只给历史时点复算用——实盘当天面板里还没有这一行，必须用报价合成。
+    """
+    want = [s for s in symbols if s in today_panel.index]
+    vals = today_panel.reindex(want).astype("float64")
+    return vals.where(np.isfinite(vals) & (vals > 0)).dropna()
+
+
+def mean_n(symbols: list[str], asof: pd.Timestamp, quotes: dict[str, Quote],
+           window: int = WINDOW, min_days: int = MIN_DAYS,
+           today_panel: pd.Series | None = None) -> pd.Series:
+    """任意窗口的均换手率（含当天那一项，口径与回测 rolling(window) 一致）。"""
+    symbols = [s for s in dict.fromkeys(symbols)]
+    hist, _ = load_history(symbols, asof, window)
+    hist = hist.sort_index().ffill()
+    if today_panel is not None:
+        today = _today_from_panel(today_panel, symbols)
+    else:
+        today_vals = {}
+        for s in symbols:
+            q = quotes.get(s)
+            if q is None or q.turnover_pct <= 0:
+                continue
+            today_vals[s] = q.turnover_pct / 100.0
+        today = pd.Series(today_vals, dtype="float64")
+    have = [s for s in symbols if s in today.index]
+    sub = hist.reindex(columns=have)
+    cnt = sub.notna().sum() + 1
+    total = sub.fillna(0.0).sum() + today.reindex(have) * TAIL_FACTOR
+    return (total / cnt).where(cnt >= min_days).dropna()
+
+
 def build(symbols: list[str], asof: pd.Timestamp,
           quotes: dict[str, Quote],
           quote_notes: dict[str, str] | None = None,
-          window: int = WINDOW, min_days: int = MIN_DAYS) -> TurnoverResult:
+          window: int = WINDOW, min_days: int = MIN_DAYS,
+          today_panel: pd.Series | None = None) -> TurnoverResult:
     """合成 20 日均换手率。缺当日报价的票会被剔除并在 notes 里写明原因。"""
     symbols = [s for s in dict.fromkeys(symbols)]
     hist, _ = load_history(symbols, asof, window)
@@ -83,18 +118,20 @@ def build(symbols: list[str], asof: pd.Timestamp,
     hist = hist.sort_index().ffill()
     notes: dict[str, str] = dict(quote_notes or {})
 
-    today_vals: dict[str, float] = {}
-    for s in symbols:
-        q = quotes.get(s)
-        if q is None:
-            notes[s] = notes.get(s, "无当日报价")
-            continue
-        if q.turnover_pct <= 0:
-            notes[s] = "当日换手率缺失（报价无成交量或股本字段异常）"
-            continue
-        today_vals[s] = q.turnover_pct / 100.0
-
-    today = pd.Series(today_vals, dtype="float64")
+    if today_panel is not None:
+        today = _today_from_panel(today_panel, symbols)
+    else:
+        today_vals: dict[str, float] = {}
+        for s in symbols:
+            q = quotes.get(s)
+            if q is None:
+                notes[s] = notes.get(s, "无当日报价")
+                continue
+            if q.turnover_pct <= 0:
+                notes[s] = "当日换手率缺失（报价无成交量或股本字段异常）"
+                continue
+            today_vals[s] = q.turnover_pct / 100.0
+        today = pd.Series(today_vals, dtype="float64")
     have = [s for s in symbols if s in today.index]
     sub = hist.reindex(columns=have)
 

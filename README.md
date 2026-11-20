@@ -1,16 +1,21 @@
 # 板块轮动 + 换手率选股 · 模拟盘
 
-标普 500 按 11 个 SPDR 板块 ETF 的 RSRS 排序选板块，板块内按 20 日均换手率取前 3、
-要求 MA10 > MA20 > MA50 多头排列，最多下探 3 个板块；月末最后一个交易日**收盘前 30 分钟**
-决策，单票满仓、不设止损。信号通过 pushplus 推送到微信，账本与决策日志提交回 `data` 分支。
+标普 500 按 11 个 SPDR 板块 ETF 的 RSRS 排序选板块。牛市里板块内按 `turn20²/turn120` 取前 3，
+要求 strong 趋势五闸（MA20>MA60、两条均线 5 日斜率为正、收盘>MA50、MA50>MA200、ADX(14)>20），
+最多下探 3 个板块；熊市不碰个股，只买「RSRS 前 3 ∩ 120 日加权斜率前 3」里最强的板块 ETF。
+月末最后一个交易日**收盘前 30 分钟**决策，单票满仓、不设止损；调仓日空仓时牛市逐日补选到
+下一个调仓日。信号通过 pushplus 推送到微信，账本与决策日志提交回 `data` 分支。
 
-定稿口径（与回测一一对应）：
+定稿口径（与回测一一对应，改任一项都会与回测脱钩）：
 
 ```
 --n 20 --m 40 --pick turnma --turnma-top 3 --turnma-sectors 3
---trend-mode ma_stack --stack-order desc
---turn-shares ws --turn-cap 0.20 --turn-tail 0.48
---pool-mode pit --min-mcap 500
+--trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60
+--trend-above 50 --trend-cross 50,200 --adx-min 20
+--turn-shares ws --turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
+--min-mcap 500
+--regime-ma 200 --regime-window 21 --bear-etf-only --bear-rank both
+--bear-intersect-top 3 --bear-slope-window 120 --bear-min-score 0
 ```
 
 市值门槛 500 亿美元是**数据清洗口径**（剔除换手率分母失真的小盘票），不是调参：

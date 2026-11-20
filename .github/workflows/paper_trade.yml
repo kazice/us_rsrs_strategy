@@ -24,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: '强制推送类型（auto=按日历判断）'
+        description: '强制推送类型（auto=按日历与补选窗口判断）'
         type: choice
-        options: [auto, rebalance, week]
+        options: [auto, rebalance, week, refill]
         default: auto
       now:
         description: '复现时刻（如 2026-11-13 15:30，缺省时区按 ET；留空=系统时钟）'
