@@ -295,7 +295,8 @@ document.getElementById('yearly').innerHTML =
     <td class="${cls(y.excess)}">${pct(y.excess)}</td><td class="neg">${pct(y.mdd)}</td>
     <td class="${cls(y.diff)}">${pct(y.diff)}</td></tr>`).join('') +
   '</tbody><tfoot><tr><td class="l dim" colspan="9" style="text-align:left;font-size:12px">' +
-  '* 首末年非完整年度（起止于回测区间两端）</td></tr></tfoot>';
+  '* 首末年非完整年度（起止于回测区间两端）　｜　调仓期按「持有期起始日」归属年份，' +
+  '所以每年 1 月的持仓（上年末信号）算在本年，年初不会缺一个月</td></tr></tfoot>';
 
 /* ---------- 调仓明细 ---------- */
 const HAS_REFILL = M.trades.some(t => t.refill);
@@ -410,15 +411,22 @@ def parse_params(dirname: str) -> list[tuple[str, str]]:
     if pm and pm.group(1) in known:
         pick = pm.group(1)
 
+    # `_crsp` 是数据源标签、不是趋势模式，先摘掉再解析后面的开关
+    crsp_scope = None
+    if "_crsp" in (tail or ""):
+        sm = re.search(r"_crsp(?:_(pool|metrics))?", tail)
+        crsp_scope = (sm.group(1) if sm and sm.group(1) else "all")
+        tail = re.sub(r"_crsp(?:_(?:pool|metrics))?", "", tail, count=1)
+
     def grab(pat: str) -> str | None:
         mm = re.search(pat, tail or "")
         return mm.group(1) if mm else None
 
     out = [("RSRS 窗口", f"N={m.group(1)} / M={m.group(2)}" if m else "-")]
-    if "_crsp" in (tail or ""):
-        scope = grab(r"_crsp_([a-z]+)")
+    if crsp_scope:
         out.append(("数据源", "CRSP 标普500 标准数据（PIT 成分 / 真实股本与市值）"
-                              + (f"，仅修 {scope}" if scope else "")))
+                              + {"pool": "，仅修成分股", "metrics": "，仅修换手率/市值/价格"}
+                              .get(crsp_scope, "")))
     out.append(("板块内选股", {
         "turnma": "换手率降序 + 趋势闸（逐块下探）",
         "turn": "换手率排名", "cvdown": "成交额 CV 降序 + 趋势闸",
@@ -513,7 +521,9 @@ def main() -> int:
         return {"cum": float(r["累计"]), "cagr": float(r["年化"]), "vol": float(r["波动"]),
                 "sharpe": float(r["夏普"]), "mdd": float(r["最大回撤"])}
 
-    holds["年份"] = pd.to_datetime(holds["信号日"]).dt.year
+    # 按「持有期起始日」归属年份：月度策略的 1 月持有期由上年 12 月末的信号决定，
+    # 按信号日归属会把每年 1 月的持仓算到上一年，看起来就像"从 2 月开始"。
+    holds["年份"] = pd.to_datetime(holds["持有期起"]).dt.year
     trades = []
     for _, r in holds.iterrows():
         def f(v):
