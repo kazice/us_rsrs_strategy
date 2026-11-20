@@ -46,6 +46,7 @@ config/ref/us_sector_holdings.csv   成分股兜底快照
 docs/HANDOFF.md                     交接文档：策略核心、逐文件职责、口径陷阱（接手先读这个）
 docs/BACKTEST_HANDOFF.md            回测交接：一条命令复现、定稿参数、产物字段、无前视口径、扫参
 docs/DATA_AUDIT_CRSP.md             数据审计：收益虚高的来源、四项对账、归因实验、修正清单
+docs/RESEARCH_SECTOR_MOMENTUM.md    因子研究：板块 RSRS 排序对未来 20 日收益到底有没有用
 docs/PAPER_TRADING.md               模拟盘：链路、候选池、与回测的口径差异
 docs/LIVE_LOG.md                    日志与回溯：目录、字段、查询命令、注意事项
 scripts/live_signal.py              信号入口（含日志落盘）
