@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -78,6 +79,7 @@ class Position:
     last_mark_date: str = ""
     last_mark_adj: float = 0.0
     moves: int = 0
+    stop_retry: int = 0           # 本期因止损重选过几次；回测里 n_stop==1 才重选，>0 就不再选
     history: list[dict] = field(default_factory=list)
 
     def is_empty(self) -> bool:
@@ -116,20 +118,27 @@ def mark_pushed(kind: str, day: str, extra: dict | None = None) -> None:
 
 
 def load_refill() -> dict:
-    """牛市补选的等待状态：``{open, since, until, bull}``。
+    """空仓后的等待状态：``{open, since, until, bull, exclude, origin}``。
 
-    只在「调仓日当天一只都没通过 + 牛市」时打开（回测 ``--bull-refill`` 的触发条件），
-    补选成交、或走到下一个调仓日时关闭。熊市不会打开。
+    两种来源，语义都是「空仓后逐日重挑到下一个调仓日」，与回测的两个分支一一对应：
+
+    - ``origin="rebalance"``：调仓日当天一只都没通过 + 牛市（回测 ``--bull-refill``）；
+    - ``origin="stop"``：持仓被 10% 止损割掉、且割肉日在该自然月 11 号之前
+      （回测 ``--stop-repick-dom 11``）。此时 ``exclude`` 带上刚割的那只票，
+      重选时跳过它、下一名顺补。
 
     ``bull`` 冻结的是**开启那天**的分支：回测的补选在信号日判定的牛市里逐日重挑，
     即使补选当天 SPY 已跌破 MA200 也不改分支。
     """
-    return _read_json(state_dir() / REFILL, {"open": False})
+    return _read_json(state_dir() / REFILL,
+                      {"open": False, "exclude": "", "origin": "rebalance"})
 
 
-def set_refill(since: str, until: str, bull: bool = True) -> None:
+def set_refill(since: str, until: str, bull: bool = True,
+               exclude: str = "", origin: str = "rebalance") -> None:
     _write_json(state_dir() / REFILL,
-                {"open": True, "since": since, "until": until, "bull": bool(bull)})
+                {"open": True, "since": since, "until": until, "bull": bool(bull),
+                 "exclude": str(exclude or ""), "origin": str(origin)})
 
 
 def clear_refill(reason: str = "") -> None:
@@ -165,6 +174,55 @@ def mark_to_market(pos: Position, quotes: dict, factors: dict[str, float]) -> fl
     return q.price * f / pos.entry_adj - 1.0
 
 
+def stop_triggered(pos: Position, quotes: dict, factors: dict[str, float],
+                   threshold: float = 0.10) -> tuple[bool, float | None, float]:
+    """止损是否触发，返回 (触发?, 持有期收益, 当前未复权价)。
+
+    与回测同口径，看的是 **adj 口径**（未复权价 × 复权因子 ÷ 建仓 adj_close）：
+    拆股 / 分红不会被误判成亏损，阈值是「相对买入价的累计跌幅」而不是当日跌幅。
+    拿不到持仓票报价时返回 ``(False, None, nan)``——宁可漏检一次，也不凭旧价割肉。
+    """
+    ret = mark_to_market(pos, quotes, factors)
+    q = quotes.get(pos.symbol) if pos.symbol else None
+    price = float(q.price) if q is not None else float("nan")
+    if ret is None or not math.isfinite(ret):
+        return False, None, price
+    # 1e-9 只用来吃掉 `0.90 / 1.00 - 1 = -0.09999999999999998` 这种浮点误差，
+    # 否则「正好跌 10%」会被判成没跌到。对实际决策没有任何影响。
+    return bool(ret <= -abs(float(threshold)) + 1e-9), ret, price
+
+
+def record_stop(pos: Position, *, day: str, action: str, price: float,
+                holding_return: float | None, note: str = "",
+                retry_used: int = 0) -> Position:
+    """止损清仓：把这一段的收益并入 nav、清空持仓、写一行 ``kind=stop`` 流水。
+
+    不能复用 :func:`record`，因为那里需要一个完整的 ``signal``（含当期目标票）。
+    止损是「只卖不买」，目标票由次日的重选决定；当天记账只负责把净值滚到位。
+    """
+    old_symbol = pos.symbol
+    if old_symbol and pos.entry_adj and holding_return is not None:
+        pos.nav *= (1.0 + holding_return)
+
+    pos.symbol = ""
+    pos.sector = ""
+    pos.entry_date = day
+    pos.entry_price = 0.0
+    pos.entry_adj = 0.0
+    pos.last_mark_date = day
+    pos.last_mark_adj = 0.0
+    pos.stop_retry = int(retry_used)
+    _append_ledger({
+        "date": day, "kind": "stop", "action": action,
+        "from_symbol": old_symbol, "to_symbol": "", "sector": "",
+        "price": round(float(price), 4) if math.isfinite(float(price)) else "",
+        "adj": "", "ret_since_entry": "" if holding_return is None else round(holding_return, 4),
+        "nav": round(pos.nav, 6), "note": note,
+    })
+    save_position(pos)
+    return pos
+
+
 def record(pos: Position, *,
            day: str, kind: str, action: str, signal, holding_return: float | None,
            note: str = "") -> Position:
@@ -198,6 +256,10 @@ def record(pos: Position, *,
 
     pos.last_mark_date = day
     pos.last_mark_adj = pos.entry_adj
+    if kind == "rebalance":
+        # 只有进入新的持有期才清零；止损后重选成交（refill）要保持本期已用掉的额度，
+        # 否则「重选后再跌 10% 还能再选一次」，与回测 n_stop == 1 的口径不符
+        pos.stop_retry = 0
     _append_ledger({
         "date": day, "kind": kind, "action": action,
         "from_symbol": old_symbol, "to_symbol": target, "sector": signal.sector,

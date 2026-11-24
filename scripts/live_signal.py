@@ -151,8 +151,10 @@ def render_rebalance(sig, action: str, action_detail: str, pos: books.Position,
 
     guard = f"候选池已按 {sig.min_mcap / 1e8:.0f} 亿美元市值门槛过滤（剔除换手率分母失真的小票）；" \
         if sig.min_mcap > 0 else ""
-    lines += ["", f"**口径提醒**：{guard}盘中最高/最低比回测的完整日振幅略窄；本策略不设止损、"
-                 "单票满仓，执行价以你的盘口为准。"]
+    lines += ["", f"**口径提醒**：{guard}盘中最高/最低比回测的完整日振幅略窄；单票满仓，"
+                 f"持仓期跌破买入价 {signal_mod.STOP_LOSS:.0%} 当日止损"
+                 f"（割肉日 < 当月 {signal_mod.STOP_REPICK_DOM} 号则重选、排除原票），"
+                 "执行价以你的盘口为准。"]
     return title, "\n".join(lines)
 
 
@@ -283,13 +285,19 @@ def render_week(sig, pos: books.Position, holding_ret: float | None, ctx: dict,
 
 def render_refill(sig, action: str, action_detail: str, pos: books.Position, ctx: dict,
                   pctx: dict, rf: dict) -> tuple[str, str]:
-    """牛市的「补选成交」推送：和调仓推送同一张筛选表，但把触发条件写清楚。"""
-    title = f"[模拟盘] {sig.asof:%m-%d} 牛市补选：{action_detail}"
+    """空仓后逐日重挑的「补选成交」推送：和调仓推送同一张筛选表，但把触发条件写清楚。"""
+    stop_origin = str(rf.get("origin")) == "stop"
+    head = "止损后重选" if stop_origin else "牛市补选"
+    title = f"[模拟盘] {sig.asof:%m-%d} {head}：{action_detail}"
+    trigger = (f"{rf.get('since', '?')} 触发 10% 止损割肉，明日起逐日重挑，"
+               f"**排除 {rf.get('exclude', '?')}**；"
+               if stop_origin else
+               f"{rf.get('since', '?')} 调仓日一只都没过关，牛市里逐日重挑；")
     lines = [
-        f"## {sig.asof:%Y-%m-%d} 牛市补选",
+        f"## {sig.asof:%Y-%m-%d} {head}",
         "",
         f"**动作**：{action} —— {action_detail}",
-        f"**触发**：{rf.get('since', '?')} 调仓日一只都没过关，牛市里逐日重挑；"
+        f"**触发**：{trigger}"
         f"窗口到下一个调仓日 {rf.get('until', '?')} 为止（仍找不到就整段空仓）",
         f"**板块**：{sig.sector}（RSRS {sig.sector_scores.get(sig.sector, float('nan')):.2f}）",
     ]
@@ -304,17 +312,128 @@ def render_refill(sig, action: str, action_detail: str, pos: books.Position, ctx
     for w in ctx.get("warnings") or []:
         lines.append(f"- ⚠ {w}")
 
-    lines += ["", "**口径提醒**：补选对应回测的 ``--bull-refill``——只在「调仓日空仓」时才逐日"
-                  "重挑，不追已经走完的行情；本策略不设止损、单票满仓，执行价以你的盘口为准。"]
+    if stop_origin:
+        lines += ["", "**口径提醒**：本条对应回测的 `--stop-repick-dom 11`——止损日在该自然月 "
+                      f"{signal_mod.STOP_REPICK_DOM} 号之前才逐日重挑，且不再买回刚割的那只；"
+                      "单票满仓，执行价以你的盘口为准。"]
+    else:
+        lines += ["", "**口径提醒**：补选对应回测的 ``--bull-refill``——只在「调仓日空仓」时才逐日"
+                      "重挑，不追已经走完的行情；单票满仓，执行价以你的盘口为准。"]
     return title, "\n".join(lines)
+
+
+def render_stop(day: str, pos: books.Position, holding_ret: float, price: float,
+                allow_repick: bool, nxt: dt.date) -> tuple[str, str]:
+    """止损推送。说清三件事：割了什么、按什么规则割的、接下来选不选。"""
+    title = f"[模拟盘] {day[5:]} 止损：卖出 {pos.symbol}"
+    dom = int(day[8:10])
+    lines = [
+        f"## {day} 止损信号",
+        "",
+        f"**动作**：止损卖出 —— {pos.symbol} @ ${price:.2f}",
+        f"- 建仓：{pos.entry_date} @ ${pos.entry_price:.2f}（{pos.sector}）",
+        f"- 持有期收益：**{holding_ret:+.2%}**（阈值 −{signal_mod.STOP_LOSS:.0%}，复权口径）",
+        f"- 累计净值：{pos.nav:.4f}（这一段亏损已并入）",
+        "",
+        f"**触发**：现价相对买入价跌幅达到 {signal_mod.STOP_LOSS:.0%}（回测 `--stop-loss`）。"
+        f"回测在**收盘价**上判定，实盘用收盘前 30 分钟现价近似，可能差最后半小时的波动。",
+        "",
+        "**下一步**：",
+    ]
+    if allow_repick:
+        lines.append(f"- 割肉日 {dom} 号 < {signal_mod.STOP_REPICK_DOM} 号 → 明日起逐日重新选股，"
+                     f"**排除 {pos.symbol}**（不再买回同一只），选到就买；"
+                     f"到 {nxt:%Y-%m-%d} 调仓日还没选到就空仓")
+    else:
+        why = (f"割肉日 {dom} 号已到 {signal_mod.STOP_REPICK_DOM} 号之后"
+               if dom >= signal_mod.STOP_REPICK_DOM else "本期已用过一次止损重选额度")
+        lines.append(f"- {why} → 本期不再选股，空仓到 {nxt:%Y-%m-%d} 调仓日")
+    lines += ["", "**口径提醒**：单票 10% 硬止损、不加仓位管理；执行价以你的盘口为准。"]
+    return title, "\n".join(lines)
+
+
+def _run_stop(j, args, today_et: dt.date) -> int:
+    """持仓期每个交易日收盘前的止损检查（对应回测 `--stop-loss 0.10 --stop-repick-dom 11`）。
+
+    只做一件事：拿持仓票现价和买入价比。所以这里**不跑全池 RSRS**，一个报价就够，
+    避免每天多烧一次 500 只票的行情。
+    """
+    day = today_et.isoformat()
+    pos = books.load_position()
+    if pos.is_empty():
+        return j.finish(0, "noop", "stop_no_position")
+
+    sym = pos.symbol
+    if sym in signal_mod.SECTOR_ETFS:
+        # 回测里熊市买的板块 ETF 不参与止损（`not buy_etf` 条件）
+        return j.finish(0, "noop", f"stop_skip_etf:{sym}")
+
+    quote_map, _qnotes = quotes.fetch_quotes([sym])
+    if sym not in quote_map:
+        return _abort(j, args, "abort", "stop_no_quote",
+                      f"止损检查拿不到 {sym} 的报价，不凭旧价割肉，本次跳过")
+
+    factors = signal_mod.current_factors([sym], pd.Timestamp(today_et))
+    hit, ret, price = books.stop_triggered(pos, quote_map, factors, signal_mod.STOP_LOSS)
+    j.extra["stop"] = {"symbol": sym, "hit": bool(hit),
+                       "ret": None if ret is None else round(float(ret), 4)}
+    if ret is None:
+        print(f"{sym} 复权因子缺失，本次不做止损判定（不凭未复权价割肉）")
+        return j.finish(0, "noop", "stop_no_factor")
+    if not hit:
+        print(f"{sym} 持有期收益 {ret:+.2%}，未触及 -{signal_mod.STOP_LOSS:.0%}，继续持有。")
+        return j.finish(0, "noop", f"stop_hold_{ret * 100:+.2f}pct")
+
+    nxt = _next_rebalance(today_et)
+    allow = (today_et.day < signal_mod.STOP_REPICK_DOM) and int(pos.stop_retry) == 0
+    title, content = render_stop(day, pos, float(ret), float(price), allow, nxt)
+    content = f"{content}\n\n`run {j.run_id}`"
+
+    print("\n" + "=" * 72)
+    print(title)
+    print("-" * 72)
+    print(content)
+    print("=" * 72)
+
+    j.snapshot_stop(quote_map, title=title, content=content,
+                    action="止损卖出", detail=f"卖出 {sym} @ ${float(price):.2f}",
+                    pos=pos, holding_ret=float(ret),
+                    extra={"threshold": signal_mod.STOP_LOSS,
+                           "repick_dom": signal_mod.STOP_REPICK_DOM,
+                           "allow_repick": bool(allow)})
+
+    if args.dry_run:
+        print("\n[dry-run] 未推送、未记账。")
+        return j.finish(0, "dryrun", "dry_run")
+
+    ok = notify.send(title, content)
+    j.notify = "ok" if ok else "failed"
+    j.patch_decision(notify_ok=ok)
+    if not ok:
+        return j.finish(1, "error", "notify_failed")
+
+    books.mark_pushed("stop", day, {"symbol": sym, "ret": round(float(ret), 4)})
+    books.record_stop(pos, day=day, action=f"止损卖出 {sym}", price=float(price),
+                      holding_return=float(ret),
+                      note=f"{ret:+.2%} 触及 -{signal_mod.STOP_LOSS:.0%}",
+                      retry_used=1)
+    if allow:
+        books.set_refill(since=day, until=nxt.isoformat(), bull=True,
+                         exclude=sym, origin="stop")
+        print(f"已开启止损重选：明日起逐日重挑（排除 {sym}），窗口到 {nxt:%Y-%m-%d}")
+    else:
+        books.clear_refill("止损后不再重选，空仓到月末")
+    return j.finish(0, "ok", f"stop_sold_{sym}_{ret * 100:+.1f}pct")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟盘信号（收盘前 30 分钟）")
     ap.add_argument("--now", default="", help="模拟当前时刻（默认取系统时钟），时区缺省按 ET")
-    ap.add_argument("--kind", default="auto", choices=["auto", "rebalance", "week", "refill"],
+    ap.add_argument("--kind", default="auto",
+                    choices=["auto", "rebalance", "week", "refill", "stop"],
                     help="auto = 按日历判断；rebalance/week = 强制按该类推送；"
-                         "refill = 牛市补选（调仓日空仓后逐日重挑）")
+                         "refill = 空仓后逐日重挑（牛市补选 / 止损重选）；"
+                         "stop = 只做持仓止损检查（每个交易日收盘前）")
     ap.add_argument("--force", action="store_true", help="无视执行窗口与幂等键")
     ap.add_argument("--dry-run", action="store_true", help="只打印不推送、不记账")
     ap.add_argument("--no-journal", action="store_true",
@@ -334,9 +453,13 @@ def main() -> int:
     today_et = now.astimezone(calendar.ET).date()
     occ = calendar.occasion_for(today_et)
     kind = occ.kind if args.kind == "auto" else args.kind
-    if kind == "none" and args.kind == "auto" and books.load_refill().get("open"):
-        # 非推送日也要看一眼：牛市调仓日空仓后，每个交易日都得重挑一次（回测 --bull-refill）。
-        kind = "refill"
+    if kind == "none" and args.kind == "auto":
+        if books.load_refill().get("open"):
+            # 非推送日也要看一眼：空仓后每个交易日都得重挑一次（--bull-refill / 止损重选）。
+            kind = "refill"
+        elif not books.load_position().is_empty():
+            # 有持仓的每个交易日都要查一次 10% 止损（回测在持仓期逐日盯收盘）。
+            kind = "stop"
 
     # 日志对象先建：后面任何一条出口（含异常）都要留一行流水，
     # 否则「那天为什么没收到信号」只能去翻 90 天就过期的 Actions log。
@@ -400,6 +523,10 @@ def _run(args, j, now, today_et, occ, kind) -> int:
     # 走到这里就是「本该出信号」：此后任何中止都要主动告警
     j.armed = True
 
+    # 止损检查只需要持仓票一个报价，不要把 500 只票全拉一遍
+    if kind == "stop":
+        return _run_stop(j, args, today_et)
+
     # --- 报价 ---
     members = signal_mod.load_members()
     if members.empty:
@@ -433,10 +560,19 @@ def _run(args, j, now, today_et, occ, kind) -> int:
     # --- 信号 ---
     # 补选窗口内沿用「调仓日定下的分支」：回测 --bull-refill 是在信号日判定的牛市里逐日重挑，
     # 中途 SPY 跌破 MA200 也不改分支（否则补选会突然跳到熊市 ETF 上）。
+    # 止损重选不一样：回测的 turnma_pick_on 不看牛熊，永远走个股链路，所以这里强制
+    # regime=True，否则熊市里止损后会被换成板块 ETF，与回测直接分叉。
     rf = books.load_refill() if kind == "refill" else {"open": False}
-    regime = bool(rf.get("bull", True)) if kind == "refill" else None
+    if kind == "refill":
+        regime = True if str(rf.get("origin")) == "stop" else bool(rf.get("bull", True))
+    else:
+        regime = None
+    ex = None
+    if kind == "refill" and rf.get("exclude"):
+        ex = {str(rf.get("exclude"))}
     try:
-        sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes, regime=regime)
+        sig = signal_mod.compute(pd.Timestamp(today_et), quote_map, qnotes,
+                                 regime=regime, exclude=ex)
     except SystemExit as exc:      # 报价还是上一交易日的快照、行情历史不够等硬性条件
         return _abort(j, args, "abort", "compute_abort", str(exc))
     j.pick, j.sector = sig.pick, sig.sector

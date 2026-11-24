@@ -62,9 +62,14 @@ def main() -> int:
            if args.now else dt.datetime.now(dt.timezone.utc))
     today = now.astimezone(calendar.ET).date()
     occ = calendar.occasion_for(today)
-    if occ.kind == "none" or occ.trigger_utc is None:
-        print(f"{today} 无需推送：{occ.reason}")
+    if occ.trigger_utc is None:
+        print(f"{today} 非交易日：{occ.reason}")
         return 0
+    # 不再按「调仓日 / 周末」筛：持仓期**每个交易日**收盘前都要查一次 10% 止损
+    # （live_signal 的 kind=stop）。空仓且没有补选窗口时，live_signal 自己会 noop，
+    # 不会推送打扰人；这里放行最多多一条 noop 流水，漏掉一次止损的代价大得多。
+    if occ.kind == "none":
+        print(f"{today} 非调仓日（{occ.reason}），仍触发一次：持仓期每日检查止损")
 
     delta = (now - occ.trigger_utc).total_seconds() / 60
     if not 0 <= delta <= args.late_min:

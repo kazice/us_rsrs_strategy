@@ -34,7 +34,7 @@ state/live/
             ├── meta.json      # 参数快照、数据源状态、git sha
             ├── quotes.csv     # 当时拿到的每只票的报价（可重放的核心）
             ├── candidates.csv # 候选池全表 + 每只票没入选的确切原因
-            ├── sectors.csv     # 11 个板块的 RSRS 与排名
+            ├── sectors.csv     # 10 个板块的 RSRS 与排名（XLRE 已剔除，与回测一致）
             ├── decision.json   # 结论：买卖动作、价格、持仓、净值
             └── push.md         # 实际推送给你的正文（截断后的版本）
 ```
@@ -55,7 +55,7 @@ state/live/
 | `run_id` | CI 用 `GITHUB_RUN_ID`；本地跑是 `L` + 时间戳（一眼能区分来源） |
 | `ts_utc` / `ts_et` | 运行时刻，两个时区都记（排查时不用自己换算） |
 | `asof` | 这次决策针对的**交易日（ET）**。注意跨时区时它与 `ts_utc` 的日期可能差一天 |
-| `kind` | `rebalance`（调仓）/ `week`（周报） |
+| `kind` | `rebalance`（调仓）/ `week`（周报）/ `stop`（持仓期每日止损检查）/ `refill`（空仓逐日重挑：牛市补选或止损重选） |
 | `status` | 见下表，**这是排查的第一站** |
 | `reason` | 中断/空跑的具体原因，`ok` 时是动作描述 |
 | `dry_run` | 是否空跑 |
@@ -90,9 +90,9 @@ state/live/
 | `mcap_src` | 市值来源：`snapshot`（Nasdaq 日快照）/ `ws`（5 日换手率反推）/ `sec`（SEC 申报股本） |
 | `mcap_ok` | 是否通过市值门槛 |
 | `turn_ok` | 是否在换手率上限内（≤20%） |
-| `ma10` / `ma20` / `ma50` | 均线（复权价口径） |
-| `stack_ok` | 是否多头排列（MA10 > MA20 > MA50） |
-| `sector_rank` | 所属板块当期在 11 个板块中的 RSRS 排名；没进前 3 为 NaN |
+| `ma20` / `s20` / `ma60` / `s60` / `ma50` / `ma200` | 均线与斜率（复权价口径；`s20` 是 MA20 的 10 日斜率，`s60` 是 MA60 的 5 日斜率） |
+| `adx` / `gate_ok` / `gate_why` | ADX(14) 值、strong 趋势五闸是否全过、第一个未过的闸门 |
+| `sector_rank` | 所属板块当期在原板块表中的 RSRS 排名（实盘 11 个含 XLRE，回测定稿 10 个）；没进前 3 为 NaN |
 | `in_top3` | 是否进入该板块换手率前 3（只有这些票才会被下探） |
 | `selected` | 是否最终入选 |
 | `reason` | **没入选的第一个原因**，见下表 |
@@ -102,13 +102,17 @@ state/live/
 | reason | 含义 |
 |---|---|
 | 空字符串 | 入选 |
+| `bear_regime` | 熊市：本期只做板块 ETF，个股全不参与 |
+| `selected_bear` | 熊市里被选中的那只 ETF |
 | `no_local_data` | 成分股但本地没有行情数据（需补数据） |
 | `no_quote` | 当天没拿到报价 |
 | `small_mcap` | 市值不达 500 亿美元 |
 | `no_turnover` | 换手率有效天数不足，算不出 20 日均值 |
 | `turn_cap` | 20 日均换手率超 20% 上限 |
+| `no_turn120` | 120 日换手率有效天数不足，排不出分 |
+| `excluded_stop` | 本期刚被止损的票，即使排进前 3 也不重选（`--stop-repick-dom`） |
 | `not_in_top3` | 在本板块换手率排不进前 3 |
-| `stack_fail` | 均线不是多头排列 |
+| `gate_fail` | 趋势五闸没过（具体卡哪一条看 `gate_why`） |
 | `not_selected` | 条件都满足，但更靠前的板块已经选出标的 |
 
 ⚠ **`reason=small_mcap` 不代表它其它条件都满足**，只是它在这条上先被拦住了。
@@ -221,7 +225,14 @@ python -m scripts.live_audit --stats 2026-11
 **8. 体量。** 一次运行约 130 KB 未压缩（`quotes.csv` 52 KB + `candidates.csv` 75 KB）。
 调仓月频 + 周报，一年约 64 次运行 ≈ 8 MB，永久保留没有压力，不需要清理策略。
 
-**9. 不要删 `decisions/`。** `--replay` 和 `--why` 都依赖它。真要归档，按年打包成
+**9. 止损是一条独立的流水。** 持仓期每个交易日都会跑一次 `kind=stop`，所以 `runs/` 里会出现
+大量 `status=noop, reason=stop_hold_±x.xxpct` 的行——那是正常的「今天没跌破 10%」。
+真触发时 `reason=stop_sold_<票>_<跌幅>pct`，同时在 `ledger.csv` 记一行 `kind=stop`
+（`from_symbol` 有值、`to_symbol` 为空、`ret_since_entry` 是止损那一段的收益）。
+止损快照（`decisions/<date>_<run_id>/`）里**没有 `candidates.csv` / `sectors.csv`**：
+那天没跑全池 RSRS，硬塞旧筛选结果只会误导复盘。
+
+**10. 不要删 `decisions/`。** `--replay` 和 `--why` 都依赖它。真要归档，按年打包成
 `.tar.gz` 后移到 `archive/`，不要直接删。
 
 **10. 仓库里没有敏感信息。** 报价与换手率都是公开行情，`journal` 不记录
@@ -246,8 +257,9 @@ replay 不一致时先看 `meta.json` 的 `git_sha` 和 `params`，确认是不�
 
 1. `--runs --since <那天>` 看有没有记录；
 2. 没有记录 → cron 没触发或 job 没跑，去 Actions 看有没有 run；
-3. `status=noop` → 看 `reason`：`kind_none`（非调仓日/非周末最后交易日）、
-   `not_in_window`（时钟不在窗口内）、`already_pushed`（今天推过了）；
+3. `status=noop` → 看 `reason`：`kind_none`（今天不是任何推送日）、`not_in_window`（时钟不在
+   窗口内）、`already_pushed`（今天推过了）、`stop_no_position`（空仓，没有止损可查）、
+   `stop_hold_±x.xxpct`（**正常**：有持仓但没跌破 10%）、`refill_wait`（补选窗口内今天仍无票）；
 4. `status=abort` → 看 `reason`：`quotes_xx_of_yy`（数据源挂了）、
    `stale_quotes_XXmin`（报价滞后超过 45 分钟）、`system_exit`（预热不足）；
 5. `status=ok` 但 `notify=failed` → 推送环节失败，去 artifact 里看 pushplus 返回码；

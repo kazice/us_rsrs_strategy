@@ -139,6 +139,71 @@ class Journal:
             log.exception("写决策快照失败（不影响信号）")
             return None
 
+    def snapshot_stop(self, quotes: dict, *, title: str = "", content: str = "",
+                      action: str = "", detail: str = "", pos=None,
+                      holding_ret: float | None = None,
+                      extra: dict | None = None) -> Path | None:
+        """止损决策的快照。
+
+        止损是「只卖不买」，不需要跑全池 RSRS，所以没有 ``sig``。这里只落
+        meta / quotes / decision / push.md 四件，``candidates.csv`` 与 ``sectors.csv``
+        留空——当天根本没算筛选，硬塞一份旧的会误导事后复盘。
+        """
+        if not self.enabled:
+            return None
+        try:
+            root = state_dir() / DECISIONS_DIR
+            root.mkdir(parents=True, exist_ok=True)
+            name = f"{self.asof.strftime('%Y-%m-%d')}_{self.run_id}"
+            target = root / name
+            seq = 1
+            while target.exists():
+                seq += 1
+                target = root / f"{name}-{seq}"
+
+            tmp = root / (target.name + ".tmp")
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            tmp.mkdir(parents=True)
+
+            ts = [q.ts for q in quotes.values() if q.ts is not None]
+            payload = {
+                "run_id": self.run_id,
+                "ts_utc": self.t0.isoformat(timespec="seconds"),
+                "ts_et": self.t0.astimezone(cal_mod.ET).isoformat(timespec="seconds"),
+                "asof": str(self.asof.date()),
+                "kind": "stop",
+                "dry_run": self.dry_run,
+                "git_sha": self.sha,
+                "quotes": {"count": len(quotes),
+                           "lag_min": None},
+                "stop": extra or {},
+                "action": action,
+                "detail": detail,
+                "from_symbol": (pos.symbol if pos is not None else ""),
+                "holding_return": holding_ret,
+                "nav": (pos.nav if pos is not None else None),
+            }
+            if ts:
+                ref = self.t0.astimezone(cal_mod.ET)
+                lags = sorted((ref - t).total_seconds() / 60.0 for t in ts)
+                payload["quotes"]["lag_min"] = round(lags[len(lags) // 2], 1)
+            (tmp / "meta.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            (tmp / "decision.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._write_quotes(tmp, quotes)
+            if content:
+                (tmp / "push.md").write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
+
+            tmp.rename(target)
+            self.decision_dir = target.relative_to(state_dir()).as_posix()
+            self.pick = payload["from_symbol"]
+            return target
+        except Exception:                               # noqa: BLE001
+            log.exception("写止损快照失败（不影响信号）")
+            return None
+
     def _write_meta(self, d: Path, sig, quotes: dict) -> None:
         from quant.live import mcap as mcap_mod
         from quant.live import signal as signal_mod
@@ -172,8 +237,11 @@ class Journal:
             "params": {
                 "rsrs_n": signal_mod.RSRS_N, "rsrs_m": signal_mod.RSRS_M,
                 "stack": list(signal_mod.STACK),
-                "slope_mas": list(signal_mod.SLOPE_MAS),
-                "stack_slope": signal_mod.STACK_SLOPE,
+                "slope_mas": [f"{w}:{n}" for w, n in signal_mod.SLOPE_WINDOWS.items()],
+                "sectors": list(signal_mod.SECTOR_ETFS),
+                "exclude_sectors": list(signal_mod.EXCLUDE_SECTORS),
+                "stop_loss": signal_mod.STOP_LOSS,
+                "stop_repick_dom": signal_mod.STOP_REPICK_DOM,
                 "above_ma": signal_mod.ABOVE_MA,
                 "cross": list(signal_mod.CROSS),
                 "adx_len": signal_mod.ADX_LEN, "adx_min": signal_mod.ADX_MIN,

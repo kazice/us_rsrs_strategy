@@ -43,18 +43,24 @@ from quant.live.quotes import Quote
 
 log = logging.getLogger(__name__)
 
-SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLRE", "XLU", "XLC"]
+SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLC"]
+# 回测 --exclude-sectors XLRE：板块层不参与排序，XLRE 的成分股也不进候选池
+EXCLUDE_SECTORS = ("XLRE",)
 BENCH = "SPY"
 RSRS_N, RSRS_M = 20, 40
 
 # 趋势闸（回测 --trend-mode strong 的口径）
 STACK = (20, 60)            # 均线多头排列：MA20 > MA60
-SLOPE_MAS = (20, 60)        # 只查这两条均线的斜率（回测 --slope-mas 20,60）
-STACK_SLOPE = 5             # 斜率 = 当前均线 − 5 个交易日前同一条均线（回测 --stack-slope 5）
+SLOPE_MAS = (20, 60)        # 只查这两条均线的斜率（回测 --slope-mas 20:10,60:5）
+SLOPE_WINDOWS = {20: 10, 60: 5}   # 每条均线各自的斜率回看天数，**不是同一个值**
 ABOVE_MA = 50               # 收盘必须站上 MA50（--trend-above 50）
 CROSS = (50, 200)           # MA50 > MA200（--trend-cross 50,200，只是大小关系，不是交叉事件）
 ADX_LEN = 14                # --adx-len 默认 14
-ADX_MIN = 20.0              # 严格大于（--adx-min 20）
+ADX_MIN = 10.0              # 严格大于（--adx-min 10）
+
+# 止损（回测 --stop-loss 0.10 --stop-repick-dom 11）
+STOP_LOSS = 0.10            # 收盘价相对买入价跌 10% 当日割肉（adj 口径，含分红拆股）
+STOP_REPICK_DOM = 11        # 割肉日在该自然月 11 号之前，才允许次日起重新选股
 
 # 牛熊（--regime-ma 200 --regime-window 21）
 REGIME_MA = 200
@@ -89,8 +95,18 @@ def load_members() -> pd.DataFrame:
     这里**不再**按 ``store.list_symbols()`` 过滤：新纳入标普 500 的票本地往往还没有行情，
     过滤掉就等于静默丢弃，而它恰恰是可能带来被动买盘的那只。没有行情的票交给
     ``compute`` 显式剔出并写进推送备注，人能看到「它进池了但没数据，去补」。
+
+    这里按 ``EXCLUDE_SECTORS`` 剔掉整个板块（回测 ``--exclude-sectors XLRE``）：
+    快照里 XLRE 的成分股会一并消失，所以实盘的板块层与候选池都是 10 个板块那一套。
     """
-    return pool_mod.load()
+    members = pool_mod.load()
+    if EXCLUDE_SECTORS and not members.empty and "sector_etf" in members.columns:
+        keep = ~members["sector_etf"].isin(list(EXCLUDE_SECTORS))
+        if not bool(keep.all()):
+            log.info("按 EXCLUDE_SECTORS 剔除 %d 只成分股：%s",
+                     int((~keep).sum()), " ".join(EXCLUDE_SECTORS))
+            members = members[keep].reset_index(drop=True)
+    return members
 
 
 def trading_lag_days(last_bar, asof) -> int:
@@ -117,6 +133,28 @@ def trading_lag_days(last_bar, asof) -> int:
             n += 1
         d += dt.timedelta(days=1)
     return n
+
+
+def current_factors(symbols: list[str], asof: pd.Timestamp,
+                    days: int = 30) -> dict[str, float]:
+    """当前复权因子（``adj_close / close``，取最近一根日线）。
+
+    止损判定拿的是「今天的未复权报价」和「建仓时的 adj_close」，中间必须乘这个因子；
+    否则一次拆股就会被当成跌掉一半、直接误割。取不到就返回空字典，调用方按「不判」
+    处理——宁可漏检一次，也不凭错口径割肉。
+    """
+    syms = [s for s in dict.fromkeys(symbols) if s]
+    if not syms:
+        return {}
+    end = pd.Timestamp(asof).normalize()
+    start = str((end - pd.Timedelta(days=max(10, days))).date())
+    adj = store.load_panel(field="adj_close", symbols=syms, start=start, end=str(end.date()))
+    cl = store.load_panel(field="close", symbols=syms, start=start, end=str(end.date()))
+    if adj is None or cl is None or adj.empty or cl.empty:
+        return {}
+    adj, cl = adj.ffill(), cl.ffill()
+    ratio = (adj.iloc[-1] / cl.iloc[-1]).replace([np.inf, -np.inf], np.nan)
+    return {str(k): float(v) for k, v in ratio.items() if np.isfinite(v)}
 
 
 @dataclass
@@ -276,7 +314,7 @@ def _gate_panels(px: pd.DataFrame, hi: pd.DataFrame, lo: pd.DataFrame,
 
     sub = px[cols]
     stack = {w: sub.rolling(w, min_periods=max(3, w // 2)).mean() for w in STACK}
-    slope = {w: stack[w] - stack[w].shift(STACK_SLOPE) for w in SLOPE_MAS}
+    slope = {w: stack[w] - stack[w].shift(SLOPE_WINDOWS[w]) for w in SLOPE_MAS}
     return {
         "stack": stack,
         "slope": slope,
@@ -320,7 +358,7 @@ def _gate(gp: dict[str, object], asof: pd.Timestamp, sym: str,
         prev, prev_w = m, w
     for w in SLOPE_MAS:
         if not np.isfinite(v[f"s{w}"]) or v[f"s{w}"] <= 0:
-            return False, v, f"MA{w} 的 {STACK_SLOPE} 日斜率 ≤ 0"
+            return False, v, f"MA{w} 的 {SLOPE_WINDOWS[w]} 日斜率 ≤ 0"
     if not np.isfinite(v[f"ma{ABOVE_MA}"]) or not (v["price"] > v[f"ma{ABOVE_MA}"]):
         return False, v, f"收盘未站上 MA{ABOVE_MA}"
     if not (np.isfinite(v[f"ma{CROSS[0]}"]) and np.isfinite(v[f"ma{CROSS[1]}"])):
@@ -337,8 +375,12 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
             allow_snapshot_ahead: bool = False,
             today_turnover: pd.Series | None = None,
             regime: bool | None = None,
+            exclude: set[str] | None = None,
             ) -> Signal:
-    """算当期目标持仓。``quotes`` 至少要覆盖 11 只板块 ETF + 候选个股。
+    """算当期目标持仓。``quotes`` 至少要覆盖 10 只板块 ETF + 候选个股。
+
+    ``exclude`` 只给「止损后重选」用：回测 ``turnma_pick_on(exclude=…)`` 会把刚割的那只
+    从候选里摘掉、下一名顺补，免得当天又买回同一只票。
 
     ``allow_snapshot_ahead`` 只给 ``live_audit --replay`` 用（历史时点复算时允许用
     今天的全市场快照取股本），正常出信号必须保持 False，否则会引入前视。
@@ -471,6 +513,8 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     gate_of: dict[str, tuple[bool, dict[str, float], str]] = {}
     bear_scores: pd.Series | None = None
 
+    ex_set = {str(s) for s in (exclude or ())}
+
     if bull:
         for rank_s, sec in enumerate(sec_all.index[:TURNMA_SECTORS], 1):
             pool = [s for s in eligible if sec_of.get(s) == sec]
@@ -480,6 +524,12 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
             top = score.reindex(pool).dropna().sort_values(ascending=False).head(TURNMA_TOP)
             for raw_s in top.index:
                 sym = str(raw_s)
+                if sym in ex_set:
+                    # 回测里这一票在 top 名额内但被 exclude 摘掉，不会顺延到第 4 名
+                    rank_of[sym] = rank_s
+                    gate_of[sym] = (False, {}, "本期已止损，排除")
+                    notes.append(f"{sym} 是本期刚止损的票，即使排进前 {TURNMA_TOP} 也不重选")
+                    continue
                 rank_of[sym] = rank_s
                 ok, vals, why = _gate(gp, asof, sym, px)
                 gate_of[sym] = (ok, vals, why)
@@ -557,6 +607,8 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
             reason = "turn_cap"
         elif not np.isfinite(tsc):
             reason = "no_turn120"
+        elif sym in ex_set:
+            reason = "excluded_stop"
         elif sym not in tried:
             reason = "not_in_top3"
         elif not ok_gate:
