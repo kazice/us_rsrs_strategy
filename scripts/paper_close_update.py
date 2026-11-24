@@ -34,6 +34,7 @@ from quant.data import fetch, store, universe
 from quant.data.sources.registry import build_chain
 from quant.live import calendar, pool, quotes
 from quant.live.signal import BENCH, SECTOR_ETFS
+from quant.live.turnover import MAX_TURNOVER
 
 log = logging.getLogger(__name__)
 
@@ -57,13 +58,38 @@ def members() -> list[str]:
 
 
 def append_turnover(day: dt.date, quote_map: dict[str, quotes.Quote]) -> int:
-    rows = [(s, day, q.turnover_pct / 100.0)
-            for s, q in quote_map.items() if q.turnover_pct > 0]
-    if not rows:
-        return 0
+    """落盘当日换手率。写之前先过两道护栏，避免把错数量级的数写进面板。
+
+    面板是排序分的分母基础：``turn20²/turn120``，一个 60 倍的股本误差就能把一只票
+    从板块第 8 推到第 1。历史上 ``sec_calc`` 段就留下过 449,828 倍的垃圾（已由
+    ``scripts/repair_turnover_panel.py`` 清理），这里从源头堵住：
+    1. 单日换手上限 100%（超过必是股本/成交量字段错了）；
+    2. 与过去半年中位数比 >20 倍且绝对 >20% —— 股本字段突变的典型特征，拒写。
+    """
     path = store.data_root() / TURNOVER_FILE
     old = (pd.read_parquet(path) if path.exists()
            else pd.DataFrame(columns=["symbol", "date", "turnover", "src"]))
+    base = (old[old["date"] >= pd.Timestamp(day) - pd.Timedelta(days=180)]
+            .groupby("symbol")["turnover"].median())
+
+    rows, suspect = [], []
+    for s, q in quote_map.items():
+        if q.turnover_pct <= 0:
+            continue
+        v = q.turnover_pct / 100.0
+        if v > MAX_TURNOVER:
+            suspect.append((s, q.turnover_pct, ">100%"))
+            continue
+        b = base.get(s)
+        if pd.notna(b) and b > 0 and v > max(0.2, 20 * b):
+            suspect.append((s, q.turnover_pct, f"历史中位 {b:.2%} 的 {v / b:.0f} 倍"))
+            continue
+        rows.append((s, day, v))
+    if suspect:
+        log.warning("换手率落盘剔除 %d 只异常：%s", len(suspect),
+                    "；".join(f"{s} {p:.2f}%（{why}）" for s, p, why in suspect[:6]))
+    if not rows:
+        return 0
     new = pd.DataFrame(rows, columns=["symbol", "date", "turnover"])
     new["src"] = "ws"
     new["date"] = pd.to_datetime(new["date"])

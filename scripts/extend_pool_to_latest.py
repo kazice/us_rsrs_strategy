@@ -14,6 +14,9 @@
     * 成分：2025-12-31 在册的票延续；2026 公告剔除的按生效日截断（本地没行情，实际已无行）；
       2026 新纳入的 16 只建 `EXT-<TICKER>` 伪 security_id（它们没有 CRSP PERMNO，不能伪造）。
     * 板块：新票取 SPDR holdings 快照；快照没有的按 SIC/默认，`sector_src` 里标来源。
+    * 预热：`EXT-<TICKER>` 在 CRSP 里没有任何历史，纳入后要再等 200 根 K 线才凑得出 MA200，
+      等于前 10 个月白买。所以新纳入的伪 ID 额外往前补 WARMUP_BARS 根本地行情
+      （2025-12-31 之前，`is_member=False`），`src` 仍记 `local_ext`，价格空间与延展段同一套。
 
 已知缺口（会打印在报告里）：
     2026 年被剔除的 17 只（MMC/DAY/PAYC/LW/MOH/MTCH/HOLX/CTRA/BK/EPAM/CPB/POOL/CAG/EA/AVB/EQR
@@ -47,6 +50,8 @@ SYM_ALIAS = {"BF": "BF-B", "BRK": "BRK-B"}
 OVERLAP_DAYS = 35          # 接缝校准用的重叠交易日数
 MIN_EXT_ROWS = 5           # 少于这么多个新交易日就不算延展成功
 MIN_OVERLAP = 5
+WARMUP_BARS = 260          # 新纳入伪 ID 往前补的交易日数（MA200 要 200 根，留余量）
+WARMUP_CAL_DAYS = 460      # 对应自然日回溯（260 根 ≈ 365 自然日 + 长假余量）
 
 
 def norm(t: str) -> str:
@@ -94,6 +99,35 @@ def sector_of(tickers: list[str]) -> dict[str, tuple[str, str]]:
             for t in tickers}
 
 
+TURNOVER_PANEL = Path("curated") / "fundamentals" / "turnover_daily.parquet"
+
+
+def _apply_turnover_panel(ext: pd.DataFrame) -> pd.DataFrame:
+    """延展段的换手率改用实盘落盘的 ``turnover_daily``（同一份数据，两边才可比）。
+
+    本地行情只有 volume，股本取自 2025-12-31 的 CRSP 快照（全年常数），回购/增发会让
+    2026 年的换手率系统性偏高或偏低；``turnover_daily`` 的 ws 段是每个交易日的真实
+    换手率。回测和实盘用同一份面板，``turn20²/turn120`` 的排序才不会被口径差带偏。
+    """
+    path = store.data_root() / TURNOVER_PANEL
+    if not path.exists() or ext.empty:
+        print("  [warn] 没有 turnover_daily 面板，延展段换手率仍按 volume/shares 算")
+        return ext
+    tv = pd.read_parquet(path)
+    tv["date"] = pd.to_datetime(tv["date"])
+    tv["turnover"] = pd.to_numeric(tv["turnover"], errors="coerce")
+    tv = tv[(tv["turnover"] > 0) & (tv["turnover"] <= 1)]
+    s = tv.set_index(["symbol", "date"])["turnover"]
+    key = pd.MultiIndex.from_arrays([ext["ticker"], ext["date"]])
+    hit = s.reindex(key).to_numpy()
+    mask = np.isfinite(hit)
+    out = ext.copy()
+    out.loc[mask, "turnover"] = hit[mask]
+    print(f"  换手率改用 turnover_daily：覆盖 {int(mask.sum()):,}/{len(out):,} 行"
+          f"（{mask.mean():.1%}），其余按 volume/shares")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="池层延展到本地行情最新日（2026 段）")
     ap.add_argument("--dry-run", action="store_true", help="只打印，不写文件")
@@ -138,10 +172,21 @@ def main() -> int:
     cal = spy.index
     i_cut = int(cal.searchsorted(cutoff))
     win_start = cal[max(0, i_cut - OVERLAP_DAYS)]
+    FIELDS = ("adj_close", "high", "low", "open", "volume")
     px = {f: store.load_panel(field=f, symbols=syms, start=str(win_start.date()),
                               end=str(end.date()))
-          for f in ("adj_close", "high", "low", "open", "volume")}
+          for f in FIELDS}
     px = {k: v.sort_index() for k, v in px.items()}
+
+    # 新纳入的伪 ID（EXT-*）在 CRSP 里没有一行历史，只有延展段的话 MA200/ADX/turn120
+    # 要等它在指数里待满 200 根才算得出来 → 单独往前多拉一段本地行情，只喂给这些票。
+    # 不能把主面板的 win_start 一起提前：接缝比例尺只该用最近 OVERLAP_DAYS 天算。
+    new_syms = sorted({t for t in adds if t in local_syms})
+    warm_start = cutoff - pd.Timedelta(days=WARMUP_CAL_DAYS)
+    pww = {f: store.load_panel(field=f, symbols=new_syms, start=str(warm_start.date()),
+                               end=str(end.date()))
+           for f in FIELDS} if new_syms else {}
+    pww = {k: v.sort_index() for k, v in pww.items()}
 
     crsp_last = (b.sort_values("date").groupby("security_id")
                  .agg(adj_close=("adj_close", "last"), facpr=("facpr", "last"),
@@ -152,11 +197,14 @@ def main() -> int:
 
     def build(sid: str, sym: str, start_member: pd.Timestamp,
               remove_on: pd.Timestamp | None, is_new: bool) -> None:
-        if sym not in px["adj_close"].columns:
+        # 新纳入的票用「往前多拉一段」的面板；延续票只用接缝窗口（CRSP 已有历史）
+        p = pww if (is_new and "adj_close" in pww
+                    and sym in pww["adj_close"].columns) else px
+        if sym not in p["adj_close"].columns:
             rep.append({"security_id": sid, "ticker": sym, "status": "no_local",
                         "rows": 0, "ratio": np.nan, "overlap": 0})
             return
-        s = px["adj_close"][sym].dropna()
+        s = p["adj_close"][sym].dropna()
         ext_idx = s.index[s.index > cutoff]
         if len(ext_idx) < MIN_EXT_ROWS:
             rep.append({"security_id": sid, "ticker": sym, "status": "too_few",
@@ -190,29 +238,40 @@ def main() -> int:
         if not np.isfinite(shares) and sym in sh.index:
             shares = float(sh[sym])
 
-        idx = ext_idx
+        ext_keep = ext_idx
         if remove_on is not None:
-            idx = idx[idx < remove_on]
-        if len(idx) < MIN_EXT_ROWS:
+            ext_keep = ext_keep[ext_keep < remove_on]
+        if len(ext_keep) < MIN_EXT_ROWS:
             rep.append({"security_id": sid, "ticker": sym, "status": "removed_early",
-                        "rows": int(len(idx)), "ratio": ratio, "overlap": overlap})
+                        "rows": int(len(ext_keep)), "ratio": ratio, "overlap": overlap})
             return
 
+        # 预热段只补给新纳入的伪 ID：延续票的 CRSP 段本来就有 200 根以上，
+        # 再叠一段本地行会和 CRSP 同日重复。
+        warm_idx = (s.index[s.index <= cutoff][-WARMUP_BARS:] if is_new
+                    else s.index[:0])
+        idx = warm_idx.append(ext_keep)
+
         adj = s.loc[idx] * ratio
-        # 接缝收益：第一行要用 CRSP 最后一天的复权价作分母，否则 2026-01 首日收益会缺
-        prev = (float(base["adj_close"]) if base and np.isfinite(base["adj_close"])
-                else float(adj.iloc[0]))
+        # 接缝收益：CRSP 有基准就用它最后一天的复权价作分母；纯本地段靠 shift(1)；
+        # 预热段第一根没有前收，只能是 NaN（拿自己当分母会凭空多一个 0 收益）
+        if base is not None and np.isfinite(base["adj_close"]):
+            prev = float(base["adj_close"])
+        elif len(warm_idx):
+            prev = np.nan
+        else:
+            prev = float(adj.iloc[0])
         ret = adj / adj.shift(1).fillna(prev) - 1.0
-        vol = px["volume"][sym].reindex(idx)
+        vol = p["volume"][sym].reindex(idx)
 
         block = pd.DataFrame({
             "security_id": sid,
             "date": idx,
             "ticker": sym,
             "close": (adj / facpr).to_numpy(),
-            "adj_open": (px["open"][sym].reindex(idx) * ratio).to_numpy(),
-            "adj_high": (px["high"][sym].reindex(idx) * ratio).to_numpy(),
-            "adj_low": (px["low"][sym].reindex(idx) * ratio).to_numpy(),
+            "adj_open": (p["open"][sym].reindex(idx) * ratio).to_numpy(),
+            "adj_high": (p["high"][sym].reindex(idx) * ratio).to_numpy(),
+            "adj_low": (p["low"][sym].reindex(idx) * ratio).to_numpy(),
             "adj_close": adj.to_numpy(),
             "volume": vol.to_numpy(),
             "shares": shares,
@@ -221,22 +280,23 @@ def main() -> int:
             "facpr": facpr,
             "ret_adj": ret.to_numpy(),
             "ret_total": ret.to_numpy(),
-            "is_member": True,
+            "is_member": (idx >= start_member),
             "src": "local_ext",
         })
         rows.append(block)
 
-        m_start = max(start_member, pd.Timestamp(idx.min()))
-        m_end = (min(pd.Timestamp(idx.max()), remove_on - pd.Timedelta(days=1))
+        m_start = max(start_member, pd.Timestamp(ext_keep.min()))
+        m_end = (min(pd.Timestamp(ext_keep.max()), remove_on - pd.Timedelta(days=1))
                  if remove_on is not None else pd.NaT)
         mem.append({"security_id": sid, "start": m_start, "end": m_end, "ticker": sym,
                     "cusip": None, "siccd": np.nan})
         tk.append({"security_id": sid, "ticker": sym, "start": m_start,
-                   "end": (m_end if pd.notna(m_end) else pd.Timestamp(idx.max())),
-                   "n_rows": int(len(idx))})
+                   "end": (m_end if pd.notna(m_end) else pd.Timestamp(ext_keep.max())),
+                   "n_rows": int(len(ext_keep))})
         rep.append({"security_id": sid, "ticker": sym,
                     "status": "ok" if not is_new else "ok_new",
-                    "rows": int(len(idx)), "ratio": round(ratio, 6), "overlap": overlap})
+                    "rows": int(len(ext_keep)), "warm_rows": int(len(warm_idx)),
+                    "ratio": round(ratio, 6), "overlap": overlap})
 
     for sid, sym in cont.items():
         build(sid, sym, pd.Timestamp(cutoff) + pd.Timedelta(days=1), rems.get(sym), False)
@@ -250,6 +310,7 @@ def main() -> int:
 
     ext = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     ext = ext.sort_values(["security_id", "date"]).reset_index(drop=True)
+    ext = _apply_turnover_panel(ext)
     mem_df = pd.DataFrame(mem)
     tk_df = pd.DataFrame(tk)
 
@@ -259,11 +320,15 @@ def main() -> int:
     for sid, sym, d in new_sec:
         g = ext[ext["security_id"] == sid]
         etf, ssrc = sec_map[sym]
+        # 预热根数 = 成分生效日之前的行数（这些行 is_member=False，只给指标预热）
+        warm = int((g["date"] < pd.Timestamp(d)).sum())
+        mbr = int(g["is_member"].sum())
         uni_rows.append({
             "security_id": sid, "ticker": sym, "rows": int(len(g)),
             "first_date": g["date"].min().date(), "last_date": g["date"].max().date(),
-            "member_days": int(len(g)), "non_member_rows": 0, "external_rows": 0,
-            "days_before_pool_start": 0, "warmup_days": 0, "warmup_ok": False,
+            "member_days": mbr, "non_member_rows": int(len(g) - mbr), "external_rows": 0,
+            "days_before_pool_start": 0, "warmup_days": warm,
+            "warmup_ok": bool(warm >= 200),
             "n_events": 0, "max_abs_ret": float(g["ret_adj"].abs().max()),
             "jump_gt_50pct": int((g["ret_adj"].abs() > 0.5).sum()),
             "max_gap_days": 0, "max_stale_run": 0,
@@ -291,6 +356,16 @@ def main() -> int:
               f"市值缺失 {int(ext['mcap'].isna().sum())} 行；"
               f"换手率缺失 {int(ext['turnover'].isna().sum())} 行")
         print(f"  新纳入伪 ID：{len(new_sec)} 只（{' '.join(s for _, s, _ in new_sec)}）")
+        nw = ext[ext["security_id"].astype(str).str.startswith("EXT-")
+                 & ~ext["is_member"]]
+        print(f"  伪 ID 预热行：{len(nw):,}（{nw['security_id'].nunique()} 只，"
+              f"src=local_ext / is_member=False）")
+        if "warm_rows" in rp.columns:
+            short = rp[(rp["status"] == "ok_new") & (rp["warm_rows"] < 200)]
+            if len(short):
+                print("  预热不足 200 根（本地行情本身没有更早的历史）：")
+                print(short[["security_id", "ticker", "warm_rows", "rows"]]
+                      .to_string(index=False))
 
     if args.dry_run:
         print("\n--dry-run：不写文件")

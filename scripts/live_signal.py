@@ -528,7 +528,8 @@ def _run(args, j, now, today_et, occ, kind) -> int:
         return _run_stop(j, args, today_et)
 
     # --- 报价 ---
-    members = signal_mod.load_members()
+    # 成分按「今天」做 point-in-time：快照落后于今天时，已公告但还没进快照的调整会补进来
+    members = signal_mod.load_members(pd.Timestamp(today_et))
     if members.empty:
         return _abort(j, args, "abort", "empty_pool", "成分股与行情池交集为空")
     syms = list(dict.fromkeys(signal_mod.SECTOR_ETFS + [signal_mod.BENCH]

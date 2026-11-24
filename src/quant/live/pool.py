@@ -59,13 +59,19 @@ def pool_path() -> Path:
     return live if live.exists() else repo_pool_path()
 
 
+# 不带类别后缀的写法：官方变更表写 "BRK"/"BF"，行情源是 "BRK-B"/"BF-B"。
+# 不归一的话 PIT 回滚会凭空多出一只 "BRK"，与快照里的 "BRK-B" 并存且没有行情。
+_CLASS_ALIAS = {"BRK": "BRK-B", "BF": "BF-B", "BRK.B": "BRK-B", "BF.B": "BF-B"}
+
+
 def normalize_symbol(sym: str) -> str:
     """把 SSGA 的点号代码换成行情源通用的横杠形式：BRK.B → BRK-B、BF.B → BF-B。
 
     不换的后果不是报错而是**静默消失**：本地行情文件按 yahoo 的 BRK-B 命名，
     拿 BRK.B 去查永远查不到，于是伯克希尔（标普 500 权重前 10）从来没进过候选池。
     """
-    return str(sym).strip().upper().replace(".", "-")
+    k = str(sym).strip().upper().replace(".", "-")
+    return _CLASS_ALIAS.get(k, k)
 
 
 def load() -> pd.DataFrame:
@@ -112,6 +118,199 @@ def recent_changes(days: int = 45, today: dt.date | None = None) -> pd.DataFrame
     today = today or dt.date.today()
     cutoff = pd.Timestamp(today - dt.timedelta(days=days))
     return df[df["date"] >= cutoff].sort_values(["date", "action"], ascending=[False, True])
+
+
+# ---------------------------------------------------------------- point-in-time 成分
+# 为什么需要这一层：
+#   `load()` 只给「最新快照」。拿它去算历史某天（live_audit --replay、回测对账、
+#   事后复盘）会把「那天之后才纳入指数」的票当成当时可买——2026-04-30 选出 6 月才
+#   纳入的 MRVL 就是这么来的。前视会同时污染选股和归因，比数据缺失更难发现。
+#   所以凡是带 asof 的调用，一律走 `members_asof()`。
+OFFICIAL_CHANGES = (Path(__file__).resolve().parents[3]
+                    / "data" / "curated" / "index" / "sp500_changes_since_2019.csv")
+
+
+def snapshot_asof(df: pd.DataFrame | None = None) -> pd.Timestamp | None:
+    """快照自带的 as_of（SSGA 落盘日期），没有就 None。"""
+    df = load() if df is None else df
+    if "as_of" not in df.columns or df["as_of"].isna().all():
+        return None
+    ts = pd.to_datetime(df["as_of"].astype(str), errors="coerce").max()
+    return None if pd.isna(ts) else pd.Timestamp(ts).normalize()
+
+
+def history_snapshots() -> list[tuple[pd.Timestamp, Path]]:
+    """``data/ref/history/us_sector_holdings_YYYYMMDD.csv`` 存档，按日期升序。
+
+    refresh() 每次成功刷新都会留一份，所以历史日期优先用存档——它连「当时的板块归属」
+    都是原样的，比从变更表倒推可靠。
+    """
+    root = data_ref_dir() / "history"
+    if not root.exists():
+        return []
+    out: list[tuple[pd.Timestamp, Path]] = []
+    for p in root.glob("us_sector_holdings_*.csv"):
+        ts = pd.to_datetime(p.stem.rsplit("_", 1)[-1], format="%Y%m%d", errors="coerce")
+        if pd.notna(ts):
+            out.append((pd.Timestamp(ts), p))
+    return sorted(out)
+
+
+def _read_snapshot_file(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["symbol"] = df["symbol"].map(normalize_symbol)
+    return df.drop_duplicates("symbol").reset_index(drop=True)
+
+
+def read_official_changes(path: Path | None = None) -> pd.DataFrame:
+    """官方成分变更表（date / add / remove）展开成长表：date / action / symbol。
+
+    这是**公告层面**的权威变更（含 2019 年以来的每次调整），与 ``index_changes.csv``
+    （本仓库 refresh 时自己 diff 出来的）互补：前者能倒推任意历史日，后者能记板块移动。
+    """
+    p = Path(path) if path is not None else OFFICIAL_CHANGES
+    if not p.exists():
+        return pd.DataFrame(columns=["date", "action", "symbol"])
+    df = pd.read_csv(p)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    rows = []
+    for r in df.itertuples():
+        for col, act in (("add", "add"), ("remove", "delete")):
+            v = getattr(r, col, "")
+            if isinstance(v, str):
+                for t in v.split(","):
+                    if t.strip():
+                        rows.append({"date": r.date, "action": act,
+                                     "symbol": normalize_symbol(t)})
+    return pd.DataFrame(rows).dropna(subset=["date"]).sort_values("date")
+
+
+def sector_lookup(base: pd.DataFrame | None = None) -> dict[str, str]:
+    """symbol → sector_etf：当前快照 → 调仓日志 → 回测池历史成员。
+
+    倒推「当时还在池里、现在已被剔除」的票需要它的板块归属，而最新快照里没有它。
+    回测池（``data/curated/sp500_pool/universe.parquet``）是同一份 S&P 500 板块口径的
+    历史并集，只取 ``sector_etf`` 这一列，不碰行情；没有这份数据时退化为空字符串
+    （这些票仍会进池，但归不到板块、不参与板块内排序，并在推送里列出来）。
+    """
+    out: dict[str, str] = {}
+    try:
+        b = load() if base is None else base
+        for s, x in zip(b["symbol"], b["sector_etf"]):
+            if str(x) and str(x) != "nan":
+                out[str(s)] = str(x)
+    except SystemExit:
+        pass
+    ch = read_changes()
+    for r in ch.itertuples():
+        if str(r.symbol) and str(r.sector_etf) and str(r.sector_etf) != "nan":
+            out.setdefault(normalize_symbol(r.symbol), str(r.sector_etf))
+    try:
+        from quant.data import pool as data_pool      # 只在实盘环境存在
+        u = data_pool.universe()
+        for t, s in zip(u["ticker"].astype(str), u["sector_etf"].astype(str)):
+            if t and t != "nan" and s and s != "nan":
+                out.setdefault(normalize_symbol(t), s)
+    except Exception:                                  # noqa: BLE001 池层缺失不该影响出信号
+        log.debug("回测池不可用，历史成员的板块归属只能靠快照/日志", exc_info=True)
+    return out
+
+
+def members_asof(asof, *, base: pd.DataFrame | None = None,
+                 official: Path | None = None,
+                 use_history: bool = True) -> pd.DataFrame:
+    """as of 那一天的 point-in-time 成分股（列与 ``load()`` 一致）。
+
+    三条路径，从准到糙：
+    1. 有 ≤ asof 的历史快照存档 → 直接用它（板块归属也是当时的）；
+    2. 快照比 asof 新 → 用官方变更表把 asof 之后发生的 add 撤掉、delete 加回；
+    3. 快照比 asof 旧 → 把 asof 之前已公告的变更推进去（快照刷不出来时的兜底）。
+
+    返回的 ``df.attrs["pit"]`` 记录走了哪条路径、动了几只，供推送正文与日志审计。
+    """
+    ts = pd.Timestamp(asof).normalize()
+    snap = load() if base is None else base.copy()
+    snap_day = snapshot_asof(snap)
+
+    info = {"asof": str(ts.date()), "src": "snapshot", "rollback": 0, "advance": 0,
+            "unknown_sector": 0}
+    hist: list[tuple[pd.Timestamp, Path]] = []
+    if use_history:
+        snaps = [(d, p) for d, p in history_snapshots() if d <= ts]
+        # 快照比 asof 新：用 ≤asof 的最近存档最准；快照不比 asof 新时，
+        # 只有「正好那天的存档」才有意义（否则不如用变更表往前推进）
+        if snaps and (snap_day is None or ts < snap_day or snaps[-1][0] == ts):
+            hist = snaps[-1:]
+
+    if hist:
+        day, path = hist[-1]
+        df = _read_snapshot_file(path)
+        info["src"] = f"archive:{day.date()}"
+        df.attrs["pit"] = info
+        return df
+
+    ev = read_official_changes(official)
+    info["changes_through"] = str(ev["date"].max().date()) if len(ev) else ""
+    if ev.empty:
+        info["src"] = "snapshot:no_changes"
+        snap.attrs["pit"] = info
+        return snap
+
+    if snap_day is not None and ts < snap_day:
+        back = ev[(ev["date"] > ts) & (ev["date"] <= snap_day)]
+    else:
+        back = ev.iloc[:0]
+    fwd = (ev[(ev["date"] > snap_day) & (ev["date"] <= ts)]
+           if snap_day is not None else ev.iloc[:0])
+
+    out = snap.copy()
+    have = set(out["symbol"].astype(str))
+    smap = sector_lookup(snap) if (len(back) or len(fwd)) else {}
+
+    def _append(sym: str) -> None:
+        nonlocal out
+        sec = smap.get(sym, "")
+        if not sec:
+            info["unknown_sector"] += 1
+        row = {c: "" for c in out.columns}
+        row.update({"symbol": sym, "sector_etf": sec, "sector_name": "",
+                    "weight": float("nan"), "as_of": str(ts.date())})
+        out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+
+    # 回滚：先撤最近发生的（同一只票可能反复进出，顺序反了会算错）
+    for r in back.sort_values("date", ascending=False).itertuples():
+        if r.action == "add":
+            if r.symbol in have:
+                out = out[out["symbol"] != r.symbol]
+                have.discard(r.symbol)
+                info["rollback"] += 1
+        elif r.symbol not in have:                     # delete → 当时还在指数里
+            _append(r.symbol)
+            have.add(r.symbol)
+            info["rollback"] += 1
+    # 推进：快照落后于 asof 时，把已公告但还没进快照的调整补上
+    for r in fwd.itertuples():
+        if r.action == "add":
+            if r.symbol not in have:
+                _append(r.symbol)
+                have.add(r.symbol)
+                info["advance"] += 1
+        elif r.symbol in have:
+            out = out[out["symbol"] != r.symbol]
+            have.discard(r.symbol)
+            info["advance"] += 1
+
+    kinds = []
+    if info["rollback"]:
+        kinds.append("rollback")
+    if info["advance"]:
+        kinds.append("advance")
+    info["src"] = "+".join(kinds) or "snapshot:noop"
+    out = out.reset_index(drop=True)
+    out.attrs["pit"] = info
+    log.info("PIT 成分 %s：%s（回滚 %d / 推进 %d / 板块未知 %d）", ts.date(), info["src"],
+             info["rollback"], info["advance"], info["unknown_sector"])
+    return out
 
 
 def render_changes_md(snapshot: pd.DataFrame | None = None) -> str:

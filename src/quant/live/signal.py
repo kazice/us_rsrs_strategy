@@ -89,7 +89,7 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def load_members() -> pd.DataFrame:
+def load_members(asof: pd.Timestamp | str | None = None) -> pd.DataFrame:
     """成分股快照（data 分支刷新过的那份优先）。
 
     这里**不再**按 ``store.list_symbols()`` 过滤：新纳入标普 500 的票本地往往还没有行情，
@@ -98,14 +98,19 @@ def load_members() -> pd.DataFrame:
 
     这里按 ``EXCLUDE_SECTORS`` 剔掉整个板块（回测 ``--exclude-sectors XLRE``）：
     快照里 XLRE 的成分股会一并消失，所以实盘的板块层与候选池都是 10 个板块那一套。
+
+    给了 ``asof`` 就走 point-in-time（``pool.members_asof``）：历史回放/对账时不能拿
+    「今天的最新快照」当那天的成分，否则 2026-04-30 会把 6 月才纳入的 MRVL 选出来。
     """
-    members = pool_mod.load()
+    members = (pool_mod.members_asof(asof) if asof is not None else pool_mod.load())
+    pit = dict(members.attrs.get("pit") or {})
     if EXCLUDE_SECTORS and not members.empty and "sector_etf" in members.columns:
         keep = ~members["sector_etf"].isin(list(EXCLUDE_SECTORS))
         if not bool(keep.all()):
             log.info("按 EXCLUDE_SECTORS 剔除 %d 只成分股：%s",
                      int((~keep).sum()), " ".join(EXCLUDE_SECTORS))
             members = members[keep].reset_index(drop=True)
+    members.attrs["pit"] = pit                    # reset_index 会丢 attrs，手动带下去
     return members
 
 
@@ -393,7 +398,7 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     from scripts.sector_stock_rsrs import rsrs_panel_fast, weighted_slope_panel
 
     asof = pd.Timestamp(asof).normalize()
-    members = load_members()
+    members = load_members(asof)          # point-in-time：asof 那天的成分，不是今天的
     if members.empty:
         raise SystemExit("成分股表为空：data 分支的 ref/us_sector_holdings.csv 缺失或损坏")
 
@@ -407,6 +412,20 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     px = store.load_panel(field="adj_close", symbols=syms, start=start, end=str(asof.date())).sort_index()
 
     notes: list[str] = []
+    # 成分口径必须让人看得见：历史时点回放要还原到那天的成分，否则就是前视
+    pit = members.attrs.get("pit") or {}
+    if pit and (pit.get("rollback") or pit.get("advance") or
+                str(pit.get("src", "")).startswith("archive")):
+        notes.append(f"成分按 point-in-time 还原到 {pit.get('asof')}："
+                     f"{pit.get('src')}（回滚 {pit.get('rollback', 0)} 只 / "
+                     f"推进 {pit.get('advance', 0)} 只）")
+    if pit.get("unknown_sector"):
+        notes.append(f"{pit['unknown_sector']} 只历史成分查不到板块归属（板块归属来源缺失），"
+                     f"不参与板块内排序")
+    ct = pit.get("changes_through")
+    if ct and str(pit.get("asof", "9999")) > ct:
+        notes.append(f"⚠ 成分还原依据的官方变更表只更新到 {ct}，之后的指数调整未纳入；"
+                     f"快照/变更表越旧，候选池越可能偏离真实成分")
     last_bar = px.index.max() if len(px.index) else None
     requested_asof = asof
     stocks_missing: list[str] = []          # 有成分没本地行情，审计时要单独标出来
@@ -495,7 +514,13 @@ def compute(asof: pd.Timestamp, quotes: dict[str, Quote],
     # 市值门槛：候选池先过 500 亿美元（与回测 --min-mcap 500 同口径）。
     # 价用盘中实时价（未复权），股本由 成交量/换手率 反推；取不到市值的票保留，
     # 与回测「拿不到市值不剔除」保持一致。没有当日报价的票没有价，自然落在保留侧。
-    px_now = pd.Series({s: q.price for s, q in quotes.items()}, dtype="float64")
+    # 历史时点复算必须用 asof 当天的收盘价——拿今天的报价去卡过去的市值门槛，
+    # 会把当时刚过线的票（KDP 这类 500 亿边界票）直接剔掉，等于换了套候选池。
+    if allow_snapshot_ahead and len(px):
+        _hist = px.loc[:asof]
+        px_now = _hist.iloc[-1] if len(_hist) else pd.Series(dtype="float64")
+    else:
+        px_now = pd.Series({s: q.price for s, q in quotes.items()}, dtype="float64")
     mgate = mcap_mod.gate(stocks, px_now, asof,
                           allow_snapshot_ahead=allow_snapshot_ahead)
     if mgate.active:

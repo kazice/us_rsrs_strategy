@@ -92,7 +92,9 @@ def bars(src: str | None = None) -> pd.DataFrame:
 
     src='crsp'     买来的标准数据（到 2025-12-31）
     src='external' 成分期之前补的预热段（外部源，缩放到 CRSP 价格空间）
-    src='local_ext' 2025-12-31 之后用本地行情延展的段（scripts/extend_pool_to_latest.py）
+    src='local_ext' 2025-12-31 之后用本地行情延展的段（scripts/extend_pool_to_latest.py）；
+                    2026 新纳入的 `EXT-<TICKER>` 伪 ID 还会额外带上 2025-12-31 之前的
+                    预热行（260 根、is_member=False），否则 MA200 要等纳入后 200 根才算得出
     """
     b = _read("bars")
     b["security_id"] = b["security_id"].astype(str)

@@ -39,6 +39,7 @@ TURNOVER_FILE = "curated/fundamentals/turnover_daily.parquet"
 WINDOW = 20
 MIN_DAYS = 10          # 与回测 rolling(20, min_periods=10) 一致
 TAIL_FACTOR = 1.0      # 实盘当天已是「截至此刻」口径，见模块 docstring
+MAX_TURNOVER = 1.0     # 单日换手上限：超过 100% 必是股本/成交量字段错了
 
 
 def turnover_path():
@@ -52,7 +53,16 @@ def load_history(symbols: list[str], asof: pd.Timestamp,
     if not path.exists():
         raise SystemExit(f"换手率面板不存在：{path}（应由 data 分支提供，见 docs/HANDOFF.md 第 5 节）")
     tv = pd.read_parquet(path)
-    tv = tv[tv["symbol"].isin(symbols)]
+    tv = tv[tv["symbol"].isin(symbols)].copy()
+    # 落盘防御：面板是 data 分支多段拼出来的，历史段曾经出现过 449,828 倍的垃圾值
+    # （股本字段取成 100 股量级）。越界值按缺失处理，宁可这只票少一天，也不让
+    # turn20²/turn120 的排序被一个错数量级的数带偏。
+    tv["turnover"] = pd.to_numeric(tv["turnover"], errors="coerce")
+    bad = (tv["turnover"] <= 0) | (tv["turnover"] > MAX_TURNOVER)
+    if bool(bad.any()):
+        log.warning("换手率面板 %d 行越界（要求 0 < x ≤ %.0f%%），按缺失处理",
+                    int(bad.sum()), MAX_TURNOVER * 100)
+        tv.loc[bad, "turnover"] = np.nan
     panel = (tv.pivot(index="date", columns="symbol", values="turnover")
              .sort_index())
     panel = panel[panel.index < asof].tail(max(lookback - 1, 1))
@@ -97,6 +107,8 @@ def mean_n(symbols: list[str], asof: pd.Timestamp, quotes: dict[str, Quote],
             q = quotes.get(s)
             if q is None or q.turnover_pct <= 0:
                 continue
+            if q.turnover_pct > MAX_TURNOVER * 100:
+                continue
             today_vals[s] = q.turnover_pct / 100.0
         today = pd.Series(today_vals, dtype="float64")
     have = [s for s in symbols if s in today.index]
@@ -129,6 +141,9 @@ def build(symbols: list[str], asof: pd.Timestamp,
                 continue
             if q.turnover_pct <= 0:
                 notes[s] = "当日换手率缺失（报价无成交量或股本字段异常）"
+                continue
+            if q.turnover_pct > MAX_TURNOVER * 100:
+                notes[s] = f"当日换手率异常（{q.turnover_pct:.0f}% > 100%），按缺失处理"
                 continue
             today_vals[s] = q.turnover_pct / 100.0
         today = pd.Series(today_vals, dtype="float64")
