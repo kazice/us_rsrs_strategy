@@ -296,9 +296,13 @@ document.getElementById('yearly').innerHTML =
     <td class="${cls(y.diff)}">${pct(y.diff)}</td></tr>`).join('') +
   '</tbody><tfoot><tr><td class="l dim" colspan="9" style="text-align:left;font-size:12px">' +
   '* 首末年非完整年度（起止于回测区间两端）　｜　调仓期按「持有期起始日」归属年份，' +
-  '所以每年 1 月的持仓（上年末信号）算在本年，年初不会缺一个月</td></tr></tfoot>';
+  '所以每年 1 月的持仓（上年末信号）算在本年，年初不会缺一个月<br>' +
+  '策略/ETF/SPY 的年度收益统一取净值曲线「上年末收盘 → 本年末收盘」的区间收益，' +
+  '与下方分年明细的「年度收益」是同一个数（同源，逐项对齐）。</td></tr></tfoot>';
 
 /* ---------- 调仓明细 ---------- */
+const YEARLY = {};
+M.yearly.forEach(v => { YEARLY[v.year] = v; });
 const HAS_REFILL = M.trades.some(t => t.refill);
 const HEAD = `<tr><th class="l">信号日</th><th class="l">持有区间</th><th>市况</th>
   <th class="l">板块</th><th class="l">持仓</th><th>板块RSRS</th><th>斜率%/日</th><th>斜率序</th>`
@@ -327,12 +331,18 @@ function renderTrades(rows){
   rows.forEach(t => { (g[t.year] = g[t.year] || []).push(t); });
   return Object.keys(g).map(y => {
     const rs = g[y];
-    const s = rs.reduce((a,b)=>a+b.ret,0);
+    const comp = rs.reduce((a,b)=>a*(1+b.ret),1) - 1;
+    // 未筛选时直接取年度汇总同一个数（净值口径），保证两张表肉眼一致；
+    // 筛选后子集没有对应的年度含义，退回落在本组行上的逐期连乘。
+    const full = rs.length === M.trades.filter(t=>t.year===+y).length;
+    const yv = YEARLY[+y];
+    const head = (full && yv) ? `年度收益 ${pct(yv.ret)} ｜ ETF 对照 ${pct(yv.etf)}`
+      : `本组逐期连乘 ${pct(comp)}`;
     const refill = rs.filter(r=>r.refill).length;
     return `<div class="year-head"><b>${y} 年</b>
       <em>${rs.length} 期 ｜ 熊市 ${rs.filter(r=>!r.bull).length} 期 ｜ 空仓 ${rs.filter(r=>!r.pick).length} 期`
       + (refill?` ｜ 补选 ${refill} 期`:'')
-      + ` ｜ 期间算术收益 ${pct(s)}</em></div>
+      + ` ｜ ${head}</em></div>
       <div class="scroll"><table><thead>${HEAD}</thead>
       <tbody>${rs.map(rowHtml).join('')}</tbody></table></div>`;
   }).join('');
@@ -345,7 +355,7 @@ document.getElementById('freg').onchange = e => {
     || (v==='bear'&&!t.bull) || (v==='cash'&&!t.pick) || (v==='refill'&&!!t.refill));
   document.getElementById('trades').innerHTML = renderTrades(rows);
   document.getElementById('cnt').textContent =
-    `已选 ${rows.length} 期（期间算术收益 ${pct(rows.reduce((a,b)=>a+b.ret,0))}）`;
+    `已选 ${rows.length} 期（逐期连乘 ${pct(rows.reduce((a,b)=>a*(1+b.ret),1)-1)}）`;
 };
 document.getElementById('cnt').textContent = `共 ${M.trades.length} 期`;
 </script>
@@ -549,6 +559,7 @@ def main() -> int:
 
     yr_ret, yr_etf = yearly(nav), yearly(net)
     yr_spy = yearly(spy_nav) if len(spy_nav) else pd.Series(dtype=float)
+    first_d, last_d = nav.index[0], nav.index[-1]
     yearly_rows = []
     for y, g in holds.groupby("年份"):
         sr = float(yr_ret.get(y, 0.0))
@@ -558,8 +569,17 @@ def main() -> int:
             "ret": sr, "etf": float(yr_etf.get(y, 0.0)), "spy": pr, "excess": sr - pr,
             "mdd": maxdd(nav[nav.index.year == y]),
             "diff": float(g["选股差"].mean()),
-            "partial": bool(y in (nav.index[0].year, nav.index[-1].year)),
+            # 只有真正被区间两端切断的年份才是「非完整年度」；末年跑满 12-31 就不算
+            "partial": bool((y == first_d.year and (first_d.month, first_d.day) != (1, 1))
+                            or (y == last_d.year and (last_d.month, last_d.day) != (12, 31))),
         })
+
+    # 对账：分年明细用「逐期收益连乘」，年度汇总用「净值曲线区间收益」，两者必须一致
+    comp = holds.groupby("年份")["个股收益"].apply(lambda s: (1 + s).prod() - 1)
+    for row in yearly_rows:
+        c = comp.get(row["year"])
+        if c is not None and abs(float(c) - row["ret"]) > 1e-3:
+            print(f"  [warn] {row['year']} 年：逐期连乘 {float(c):+.4%} ≠ 净值口径 {row['ret']:+.4%}")
 
     meta = {
         "params": parse_params(d.name),

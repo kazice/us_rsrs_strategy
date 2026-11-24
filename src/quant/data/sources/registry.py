@@ -11,12 +11,14 @@ import pandas as pd
 from quant.config import get_settings
 from quant.data.sources.alpaca import AlpacaSource
 from quant.data.sources.base import BarSource
+from quant.data.sources.tencent import TencentSource
 from quant.data.sources.tiingo import TiingoSource
 from quant.data.sources.yahoo import YahooSource
 
 log = logging.getLogger(__name__)
 
 _FACTORY = {
+    "tencent": TencentSource,
     "yahoo": YahooSource,
     "alpaca": AlpacaSource,
     "tiingo": TiingoSource,

@@ -1,12 +1,33 @@
-"""板块 → 个股 双层 RSRS：先选板块 ETF，再在该板块成分股里选 1 只个股。
+"""板块 → 个股 双层 RSRS 回测（唯一数据源：`data/curated/sp500_pool`）。
 
-第一层：11 个板块 ETF 的 RSRS（口径与 scripts.sector_rsrs 完全一致，N/M/锚点同源）
-第二层：在该板块的成分股里，用同一套 RSRS（默认同样 N/M）选分数最高的一只
+数据口径
+--------
+* 个股一律按 **security_id（CRSP PERMNO）** 取数：价格、成交量、市值、换手率、
+  成分区间、板块归属全部来自 `quant.data.pool`。ticker 只是某个时点的别名，
+  在这里只用于输出展示，不参与选股、排序、持仓或去重。
+* 成分股是 point-in-time 的：`pool.membership_mask()` 逐日给掩码，窗口内当过成分股的
+  票都在候选池里（含后来被剔除、退市的），不用今天的名单回测过去。
+* 复权价用池层算好的 `adj_close/adj_high/adj_low`（CRSP 累计因子做除数，含拆股/合股/分立），
+  `close` 是原始价、只在需要展示时用。
+* 池层自带 `src='external'` 的预热段（外部源按重叠区间缩放对齐到 CRSP 价格空间），
+  所以新纳入指数的票在成分期之前也有 MA200 可算，不需要再从本地行情补前导。
+* 板块 ETF 与 SPY 不在标普 500 成分股池里，只有这一处例外：从本地 data 分支读
+  （`store.load_panel`）。除此之外没有第二套个股数据源。
 
-成分股来源：config/ref/us_sector_holdings.csv（SPDR 官方 holdings 快照，503 只，
-本地行情覆盖 492 只）。**这是当前快照，回测过去存在幸存者偏差**。
+已知边界
+--------
+* 池的行情到 CRSP 数据边界为止（`pool.last_date()`）；`--end` 超过它会被截断并提示。
+  以前那套「2026 年用本地行情按截止日比值接续」属于第二份数据源，已删除。
+* 退市收益在 `pool.exits()` 里单独存（如 FRC -90.5%）。本回测目前仍按「末行价格消失 →
+  当期剩余天数收益记 0」处理，与历史口径保持一致；把它叠加进净值会改动收益，属于口径变更，
+  需要单独评估后再做。
 
-产出同时记录「同一板块直接买 ETF」的对照净值，用来判断选股这一层是加分还是减分。
+策略
+----
+第一层：11 个板块 ETF 的 RSRS（N/M 与 `scripts.sector_rsrs` 同源）。
+第二层：在该板块的成分股里按 `--pick` 规则选 1 只（默认 RSRS 最高；定稿口径是
+`turn20²/turn120` 降序 + strong 五闸逐块下探）。
+牛熊：SPY 与 MA(`--regime-ma`) 比较；熊市按 `--bear-*` 分支买板块 ETF 或空仓。
 """
 from __future__ import annotations
 
@@ -16,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant.data import crsp, store, universe
+from quant.data import pool, store
 from scripts.sector_rsrs import anchors, perf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,13 +45,16 @@ BENCH = "SPY"
 SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLRE", "XLU", "XLC"]
 
 
+# ---------------------------------------------------------------------------
+# 指标
+# ---------------------------------------------------------------------------
 def rsrs_panel_fast(high: pd.DataFrame, low: pd.DataFrame, n: int, m: int,
                     spec: str = "strict", r2_th: float = 0.5,
                     slope_lim: float = 10.0) -> pd.DataFrame:
     """与 sector_rsrs.rsrs_panel 等价的向量化实现（已逐值比对）。
 
     逐列循环的版本在 500 只股票上要几分钟，这里改成 rolling 均值算协方差：
-    beta = (E[LH] − E[L]E[H]) / (E[L²] − E[L]²)，r2 = 1 − 残差方差 / E[H²] − E[H]²。
+    beta = (E[LH] − E[L]E[H]) / (E[L²] − E[L]²)，r2 = 1 − 残差方差 / (E[H²] − E[H]²)。
     """
     H, L = high.astype(float), low.astype(float)
     r = lambda df: df.rolling(n, min_periods=n)  # noqa: E731
@@ -55,13 +79,16 @@ def rsrs_panel_fast(high: pd.DataFrame, low: pd.DataFrame, n: int, m: int,
     return (s - s.rolling(m).mean()) / s.rolling(m).std(ddof=0)
 
 
-def adx_panel(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
-              n: int = 14) -> pd.DataFrame:
-    """Wilder ADX（趋势强度，不区分方向）。
+def dmi_panels(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
+               n: int = 14) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Wilder DMI，返回 ``(ADX, +DI, -DI)``。
 
     公式链：TR / ±DM → RMA 平滑 → ±DI → DX → 再平滑一次得 ADX。
     平滑用 ``ewm(alpha=1/n, adjust=False)``，等价于 Wilder 的递归均值；``min_periods=n``
     保证前 n-1 根是 NaN，不给「刚上市几天就判强趋势」的机会。
+
+    ADX 只量趋势强度、不分方向：一路阴跌也能把 ADX 抬到 40 以上。要判「多头趋势」，
+    得再看 +DI 与 -DI 谁在上面（+DI > -DI 才说明这波趋势是买方主导）。
     """
     h, l, c = high.astype(float), low.astype(float), close.astype(float)
     pc = c.shift(1)
@@ -77,7 +104,13 @@ def adx_panel(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
     mdi = 100.0 * smooth(minus_dm) / atr.where(atr > 0)
     den = (pdi + mdi).where((pdi + mdi) > 0)
     dx = 100.0 * (pdi - mdi).abs() / den
-    return smooth(dx)
+    return smooth(dx), pdi, mdi
+
+
+def adx_panel(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame,
+              n: int = 14) -> pd.DataFrame:
+    """只要 ADX（保留旧签名，其它调用方无需改动）。"""
+    return dmi_panels(high, low, close, n)[0]
 
 
 def weighted_slope_panel(px: pd.DataFrame, n: int = 20) -> pd.DataFrame:
@@ -85,12 +118,7 @@ def weighted_slope_panel(px: pd.DataFrame, n: int = 20) -> pd.DataFrame:
 
     为什么不用等权回归：等权斜率对窗口首尾同样敏感，一个旧的跳空会拖住整段判断。
     这里给近期更大的权重（w = 1..n，最新一天权重最大），得到的斜率更接近「现在在不在涨」。
-
-    为什么除以均价：XLK 两百多块、XLF 五十块，绝对斜率不可比；归一化后是「每天涨百分之几」，
-    11 个板块才能放在一起排序。
-
-    这是给熊市用的：RSRS 是 high~low 回归的 z-score，衡量的是「日内强弱关系」的相对位置，
-    在单边下跌里会频繁换手（2022 年就在 XLU/XLK/XLC/XLY 之间来回跳，而全年最强是 XLE）。
+    为什么除以均价：XLK 两百多块、XLF 五十块，绝对斜率不可比；归一化后才是「每天涨百分之几」。
     """
     t = np.arange(n, dtype=float)
     w = np.arange(1.0, n + 1.0)
@@ -104,169 +132,117 @@ def weighted_slope_panel(px: pd.DataFrame, n: int = 20) -> pd.DataFrame:
     return slope / level.where(level > 0)
 
 
-def mcap_pool_mask(stocks: list[str], cal: pd.DatetimeIndex,
-                   start: str, end: str, top_n: int = 500,
-                   shares_src: str = "current") -> pd.DataFrame:
-    """逐期「假设成分股」掩码：每个交易日按当时的市值排名，前 top_n 只在池内。
+def parse_slope_spec(spec: str, default_win: int) -> dict[int, int]:
+    """解析「均线:窗口」列表 → {均线: 窗口}（保持书写顺序）。
 
-    为什么这么近似
-    --------------
-    标普 500 没有公开的历史成分股名单可抓（SSGA 只给当前快照、Wikipedia 在本机不可达），
-    但成分股变动的主要驱动就是市值排名：涨上去的进、跌下去的出，且调整只在季度
-    rebalance 生效。用「当时的市值排名」做代理，能挡掉一半前视——今天在池里、当时还
-    排不进前 500 的票。
-
-    排名宇宙必须够大
-    ----------------
-    只在 492 只成分股内部排名毫无分辨力（本来就都是大盘股，取 top500 等于全取）。
-    所以宇宙用本地全部有行情的票（约 1050 只）。但**PIT 股本只覆盖那 501 只成分股**，
-    其余 550 只没有申报股本，只能用 ``shares_src=current`` 的口径补：
-
-    - ``current``：股本 = universe 快照的 市值/价格（当前值，全市场覆盖），
-      市值序列 = **复权收盘价 × 当前股本**。复权价已经把拆股历史折算到今天，
-      与当前股本配套，量级正确；分红会造成高股息票的历史市值被系统性低估（约 2%~3%/年），
-      对 400~500 名边界有影响，对头部无影响。
-    - ``sec``：只在有 SEC 申报股本的 501 只里排名（等于没有过滤效果，仅作对照）。
-
-    ⚠ 残留偏差：宇宙本身是「今天的 top-1000」，当年大、现在小的票不在里面，
-    这部分幸存者偏差改不掉；被剔除出指数的票仍然一个都没有。
+    支持每根均线用不同窗口，因为「MA20 的 10 日斜率」和「MA60 的 5 日斜率」是两个量：
+    短线均线要用更长的观察窗才能滤掉噪声，长线均线本来变化就慢，5 日足够。
+    写法：
+        "20:10,60:5" → {20: 10, 60: 5}
+        "20,60"      → 两者都用 default_win（= --stack-slope，兼容旧命令）
+        ""           → {}
     """
-    from quant.data import universe as uni_mod
-
-    px = store.load_panel(field="adj_close", symbols=list(store.list_symbols()),
-                          start=start, end=end).sort_index()
-    if shares_src == "sec":
-        so = pd.read_parquet(
-            ROOT / "data" / "curated" / "fundamentals" / "shares_outstanding.parquet")
-        so["filed"] = pd.to_datetime(so["filed"])
-        so["symbol"] = so["symbol"].astype(str).str.upper()
-        so = so[so["val"] > 0].sort_values("filed")
-        # 与 build_turnover_ws 同一条占位值判据：SPAC 期会填 1000 股这种数
-        med = so.groupby("symbol")["val"].transform("median")
-        so = so[~((so["val"] < 0.01 * med) | (so["val"] < 1e6))]
-        left = pd.MultiIndex.from_product([px.index, so["symbol"].unique()],
-                                          names=["date", "symbol"]).to_frame(index=False)
-        merged = pd.merge_asof(left.sort_values("date"), so, left_on="date",
-                               right_on="filed", by="symbol", direction="backward")
-        shares = merged.pivot(index="date", columns="symbol", values="val")
-        shares = shares.reindex(px.index).ffill().bfill()
-        mcap = px.reindex(columns=shares.columns) * shares
-    else:
-        uni = pd.read_parquet(uni_mod.latest_file())
-        uni["symbol"] = uni["symbol"].astype(str).str.upper()
-        sh = (uni["market_cap"] / uni["price"]).replace([np.inf, -np.inf], np.nan)
-        sh = pd.Series(sh.values, index=uni["symbol"]).dropna()
-        sh = sh[sh > 0]
-        cols = [c for c in px.columns if c in sh.index]
-        mcap = px[cols].mul(sh[cols], axis=1)
-
-    rank = mcap.rank(axis=1, ascending=False, method="min")
-    mask = (rank <= top_n).reindex(columns=stocks, fill_value=False).fillna(False)
-    keep = int(mask.sum(axis=1).mean())
-    print(f"市值池：宇宙 {mcap.shape[1]} 只（股本口径 {shares_src}），top {top_n}，"
-          f"成分股日均在池 {keep} 只 / {len(stocks)}")
-    if keep < 0.9 * len(stocks):
-        # 真实的标普 500 成分股绝大多数都应该在前 500 名市值里。保留率掉到 90% 以下，
-        # 说明这套排名口径在误伤真成员（宇宙是按今天的市值筛的，会系统性地压低"今天小、
-        # 当年在"的票），此时的结果不能当结论用。
-        print(f"⚠ 只保留 {keep}/{len(stocks)}（{keep / len(stocks):.0%}）成分股，"
-              f"低于 90%：这是排名口径的误伤，不是真实的调入调出，结果不可作结论")
-    for d in [cal[0], cal[len(cal) // 2], cal[-1]]:
-        if d in mask.index:
-            print(f"  {d.date()} 在池 {int(mask.loc[d].sum())} 只")
-    return mask
+    out: dict[int, int] = {}
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            w, win = tok.split(":", 1)
+            out[int(w)] = int(win)
+        else:
+            out[int(tok)] = int(default_win)
+    return out
 
 
-def mcap_above(mcap: pd.DataFrame | None, sym: str, dt: pd.Timestamp, thr: float) -> bool:
-    """当日市值是否严格大于 thr（单位：美元）。面板缺失 / 不设门槛 / 取不到市值时放行。
-
-    口径与 ``--min-mcap`` 那道闸一致：市值 = 未复权收盘价 × 股本（股本优先用
-    成交量 ÷ 换手率 的逐日中位数，缺换手率的票用 universe 快照的 市值/价格 兜底）。
-    """
+def mcap_above(mcap: pd.DataFrame | None, sid: str, dt: pd.Timestamp, thr: float) -> bool:
+    """当日市值是否严格大于 thr（单位：美元）。面板缺失 / 不设门槛 / 取不到市值时放行。"""
     if mcap is None or thr <= 0:
         return True
-    if sym not in mcap.columns or dt not in mcap.index:
+    if sid not in mcap.columns or dt not in mcap.index:
         return True
-    v = float(mcap.at[dt, sym])
+    v = float(mcap.at[dt, sid])
     return bool(np.isfinite(v) and v > thr)
 
 
-GICS_TO_ETF = {
-    "Information Technology": "XLK", "Financials": "XLF", "Health Care": "XLV",
-    "Consumer Discretionary": "XLY", "Consumer Staples": "XLP", "Energy": "XLE",
-    "Industrials": "XLI", "Materials": "XLB", "Real Estate": "XLRE",
-    "Utilities": "XLU", "Communication Services": "XLC",
-}
+# ---------------------------------------------------------------------------
+# 取数：池层（个股）+ 本地（板块/基准 ETF，池里没有）
+# ---------------------------------------------------------------------------
+def load_etf(sectors: list[str], load_start: str, end_s: str) -> dict[str, pd.DataFrame]:
+    """板块 ETF + SPY 的复权价/高/低。池层只覆盖标普 500 成分股，ETF 只能从这里取。"""
+    syms = list(sectors) + [BENCH]
+    out = {}
+    for field in ("adj_close", "high", "low"):
+        p = store.load_panel(field=field, symbols=syms, start=load_start, end=end_s)
+        if p.empty:
+            raise SystemExit(
+                f"本地没有 ETF 行情（{field}）：回测需要 {len(syms)} 只板块/基准 ETF。"
+                "池层只含标普 500 成分股，ETF 不在池内。")
+        out[field] = p.sort_index().ffill().reindex(columns=syms)
+    return out
 
 
-def load_sp500_change_events() -> pd.DataFrame:
-    """S&P 官方公告里的标普 500 调入调出事件（scripts.fetch_sp_index_changes 的产物）。
+def load_pool(start: pd.Timestamp, end: pd.Timestamp, warm_days: int,
+              exclude: set[str], sectors: list[str]) -> dict:
+    """按 security_id 取个股面板、成分掩码、市值、换手率、板块归属。"""
+    load_start = (start - pd.DateOffset(days=warm_days)).strftime("%Y-%m-%d")
+    end_s = end.strftime("%Y-%m-%d")
 
-    只保留带代码的行：2020-09 之后的公告才有 ticker，更早的行只有公司名，无法回放。
-    """
-    ch = pd.read_csv(ROOT / "data" / "curated" / "index" / "sp_constituent_changes.csv",
-                     encoding="utf-8-sig")
-    sp = ch[ch["index_name"] == "S&P 500"].copy()
-    sp["effective_date"] = pd.to_datetime(sp["effective_date"], errors="coerce")
-    sp = sp[sp["effective_date"].notna() & sp["ticker"].notna()].copy()
-    sym = sp["ticker"].astype(str).str.strip().str.upper()
-    sym = sym.str.split("/").str[0].str.rstrip("*").str.replace(".", "-", regex=False)
-    sp["symbol"] = sym
-    sp = sp[sp["symbol"].str.match(r"^[A-Z][A-Z0-9\-]{0,5}$")]
-    return sp.drop_duplicates(["effective_date", "action", "symbol"]).sort_values("effective_date")
+    etf = load_etf(sectors, load_start, end_s)
+    cal = etf["adj_close"].index
 
+    u = pool.universe().set_index("security_id")
+    ids = [i for i in pool.ids_in_window(start, end)
+           if i in u.index and str(u.at[i, "sector_etf"]) in sectors]
+    if exclude:
+        ids = [i for i in ids if i not in exclude]
+    if not ids:
+        raise SystemExit("窗口内没有任何可用成分股")
 
-def pit_pool_mask(stocks: list[str], cal: pd.DatetimeIndex,
-                  ev: pd.DataFrame, anchor: set[str]) -> pd.DataFrame:
-    """逐日 point-in-time 成分股掩码：从今天的 anchor 名单出发，倒着撤销官方公告里的变动。
+    px_s = pool.panel("adj_close", ids, load_start, end_s).reindex(cal)
+    hi_s = pool.panel("adj_high", ids, load_start, end_s).reindex(cal)
+    lo_s = pool.panel("adj_low", ids, load_start, end_s).reindex(cal)
+    mcap = pool.panel("mcap", ids, load_start, end_s).reindex(cal)
+    turn = pool.panel("turnover", ids, load_start, end_s).reindex(cal)
 
-    倒放规则：当年「加入」的票，倒推到该生效日之前就该从名单里摘掉；当年「删除」的票要放回来。
-    """
-    idx = {s: i for i, s in enumerate(stocks)}
-    vec = np.zeros(len(stocks), dtype=bool)
-    for s in anchor:
-        if s in idx:
-            vec[idx[s]] = True
-    rows = [(r.symbol, r.action, r.effective_date)
-            for r in ev.itertuples() if r.symbol in idx]
-    rows.reverse()
-    mat = np.zeros((len(cal), len(stocks)), dtype=bool)
-    j = 0
-    for i in range(len(cal) - 1, -1, -1):
-        d = cal[i]
-        while j < len(rows) and rows[j][2] > d:
-            sym, act, _ = rows[j]
-            vec[idx[sym]] = (act == "Delete")
-            j += 1
-        mat[i] = vec
-    mask = pd.DataFrame(mat, index=cal, columns=stocks)
-    for d in [cal[0], cal[len(cal) // 2], cal[-1]]:
-        print(f"  {d.date()} 在池 {int(mask.loc[d].sum())} 只")
-    return mask
+    px = pd.concat([etf["adj_close"], px_s], axis=1).sort_index().ffill()
+    hi = pd.concat([etf["high"], hi_s], axis=1).sort_index().ffill()
+    lo = pd.concat([etf["low"], lo_s], axis=1).sort_index().ffill()
 
+    # 区间内完全没有行情的票剔掉，否则 px[stocks] 会因列缺失报 KeyError
+    have = [i for i in ids if i in px.columns and i in hi.columns and i in lo.columns]
+    if len(have) < len(ids):
+        gone = sorted(set(ids) - set(have))
+        tick = pool.display_tickers()
+        print(f"区间内无行情的成分股 {len(gone)} 只已剔除："
+              f"{' '.join(str(tick.get(g, g)) for g in gone)}")
+    ids = have
 
-def load_members() -> pd.DataFrame:
-    h = pd.read_csv(ROOT / "config" / "ref" / "us_sector_holdings.csv")
-    h["symbol"] = h["symbol"].astype(str).str.strip().str.upper()
-    pool = set(store.list_symbols())
-    h = h[h["symbol"].isin(pool)].drop_duplicates("symbol").reset_index(drop=True)
-    # 市值取自 universe 快照（asof 2026-10-27），只有当前值，无历史序列
-    uni = pd.read_parquet(universe.latest_file())
-    mcap = dict(zip(uni["symbol"].astype(str).str.upper(), uni["market_cap"]))
-    h["mcap"] = h["symbol"].map(mcap)
-    return h
+    mask = pool.membership_mask(cal, ids)
+    sec_of = {i: str(u.at[i, "sector_etf"]) for i in ids}
+    sec_src = {i: str(u.at[i, "sector_src"]) for i in ids}
+    tick_of = {i: str(pool.display_tickers().get(i, i)) for i in ids}
+
+    return {"ids": ids, "cal": cal, "px": px, "hi": hi, "lo": lo,
+            "etf_px": etf["adj_close"], "mask": mask, "mcap": mcap, "turn": turn,
+            "sec_of": sec_of, "sec_src": sec_src, "tick_of": tick_of,
+            "load_start": load_start, "end": end}
 
 
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="板块→个股 双层 RSRS")
+    ap = argparse.ArgumentParser(
+        description="板块→个股 双层 RSRS（数据源：sp500_pool，security_id 主键）")
     ap.add_argument("--n", type=int, default=20, help="板块层回归窗口")
     ap.add_argument("--m", type=int, default=40, help="板块层标准化窗口")
     ap.add_argument("--sn", type=int, default=0, help="个股层回归窗口，0 = 同 --n")
     ap.add_argument("--sm", type=int, default=0, help="个股层标准化窗口，0 = 同 --m")
-    ap.add_argument("--cost", type=float, default=0.0005)
+    ap.add_argument("--cost", type=float, default=0.0005, help="单边成本")
     ap.add_argument("--spec", default="strict", choices=["strict", "simple"])
     ap.add_argument("--start", default="2021-11-13")
-    ap.add_argument("--end", default="2026-10-26")
+    ap.add_argument("--end", default="", help="默认取池内最后一天（CRSP 数据边界）")
     ap.add_argument("--freq", default="M", choices=["M", "W", "H", "M2"])
     ap.add_argument("--pick", default="rsrs",
                     choices=["rsrs", "mcap", "mmin", "turn", "dvol", "dvolcv", "dvolcvh",
@@ -279,15 +255,17 @@ def main() -> int:
                          "turnma 同上但按换手率降序找（换手率最大 + 均线排列）")
     ap.add_argument("--cvdown-top", type=int, default=3, help="--pick cvdown 时每个板块看 CV 前几名")
     ap.add_argument("--cvdown-sectors", type=int, default=3, help="--pick cvdown 时最多下探几个板块")
-    ap.add_argument("--turn-shares", default="ws",
-                    choices=["ws", "snapshot"],
-                    help="换手率口径：ws = 直接用 westock 日 K 换手率（美股为成交量/总股本，默认，"
-                         "定稿口径）；snapshot = 旧口径（当前快照市值/价格推算股本，含前视，仅对照）")
     ap.add_argument("--turn-noise", type=float, default=0.0,
                     help="给换手率注入对数正态噪声的标准差（0 = 不扰动），用于稳健性检验")
     ap.add_argument("--seed", type=int, default=0, help="--turn-noise 的随机种子")
     ap.add_argument("--turnma-top", type=int, default=3, help="--pick turnma 时每个板块看换手率前几名")
     ap.add_argument("--turnma-sectors", type=int, default=3, help="--pick turnma 时最多下探几个板块")
+    ap.add_argument("--turn-trend-first", action="store_true",
+                    help="--pick turnma 时先筛趋势再排序：板块内所有票先过趋势闸，"
+                         "合格的再按换手率降序取第一只（此时 --turnma-top 不生效）。"
+                         "默认口径相反——先取换手率前 N 只，再在里面找第一只趋势合格的")
+    ap.add_argument("--debug-pool", action="store_true",
+                    help="诊断用：信号日打印每个板块的候选数、趋势合格数、合格票的换手率名次")
     ap.add_argument("--bull-refill", action="store_true",
                     help="牛市当期选不出个股时，从下一个交易日起逐日重挑（当日 RSRS / 换手率 / "
                          "趋势闸全部重算），买到为止；一直找不到才空仓到下一个调仓日")
@@ -307,18 +285,41 @@ def main() -> int:
                     help="ma_stack 的排列方向：asc = MA10<MA20<MA50（空头排列，默认）；"
                          "desc = MA10>MA20>MA50（多头排列）")
     ap.add_argument("--stack-slope", type=int, default=5,
-                    help="--trend-mode strong：要求每条均线 MA(t) > MA(t-该值)，0 = 不检查")
-    ap.add_argument("--slope-mas", default="20,60",
-                    help="--trend-mode strong：哪几条均线必须斜率为正（默认 20,60）。"
-                         "MA5 斜率翻转太快，单日噪声就能否决一只原本多头排列的票，"
-                         "默认不再要求它；传 5,20,60 可回到旧口径，空字符串 = 不检查")
+                    help="--trend-mode strong：斜率窗口的默认值；--slope-mas 里没写 :窗口 时用它，"
+                         "0 = 不检查")
+    ap.add_argument("--slope-mas", default="20:10,60:5",
+                    help="--trend-mode strong：哪几条均线必须斜率为正、各自用多长窗口，"
+                         "写法「均线:窗口」逗号分隔。默认 20:10,60:5 = MA20 的 10 日斜率、"
+                         "MA60 的 5 日斜率都为正。只写均线名则用 --stack-slope 的窗口；"
+                         "空字符串 = 不检查")
     ap.add_argument("--trend-above", type=int, default=200,
                     help="--trend-mode strong：收盘价必须站上的均线长度，0 = 不检查")
     ap.add_argument("--trend-cross", default="50,200",
                     help="--trend-mode strong：均线先后关系「快,慢」，要求 MA(快) > MA(慢)；"
                          "空字符串 = 不检查")
-    ap.add_argument("--adx-min", type=float, default=20.0,
+    ap.add_argument("--adx-min", type=float, default=10.0,
                     help="--trend-mode strong：ADX 下限（严格大于），0 = 不检查")
+    ap.add_argument("--adx-dir", action="store_true",
+                    help="--trend-mode strong：ADX 达标之外还要求 +DI > -DI（趋势方向得是买方主导）。"
+                         "ADX 只量强度不分方向，阴跌票的 ADX 一样能很高")
+    ap.add_argument("--max-near-high", type=float, default=0.0,
+                    help="追高闸：收盘价距最近 --near-high-len 日最高价不足该比例时跳过该候选"
+                         "（0.01 = 离高点 1%% 以内算追高），0 = 不检查。"
+                         "目的是不买在放量突破当天，改买回踩过、刚转强的")
+    ap.add_argument("--near-high-len", type=int, default=63,
+                    help="追高闸的回看窗口（交易日），默认 63 ≈ 3 个月")
+    ap.add_argument("--pos-band", default="",
+                    help="位置分位区间（如 0.3,0.75）：pos = (C - 最低Low) / (最高High - 最低Low)，"
+                         "窗口见 --pos-len。只买 pos 落在区间内的候选——低端排除破位，高端排除追高。"
+                         "空字符串 = 不检查")
+    ap.add_argument("--pos-len", type=int, default=20,
+                    help="--pos-band 的回看窗口（交易日），默认 20")
+    ap.add_argument("--bb-delta", type=float, default=0.0,
+                    help="布林带追高闸（以自身标准差为单位）：z = (C - MA) / 标准差，"
+                         "上轨是 z = --bb-mult。要求 z <= --bb-mult - delta，即离上轨至少留 "
+                         "delta 个标准差。0 = 不检查")
+    ap.add_argument("--bb-window", type=int, default=20, help="布林带均线窗口，默认 20")
+    ap.add_argument("--bb-mult", type=float, default=2.0, help="布林带标准差倍数，默认 2")
     ap.add_argument("--adx-len", type=int, default=14, help="ADX 的 Wilder 平滑窗口")
     ap.add_argument("--bear-sector-ma", type=int, default=0,
                     help="熊市（--regime-ma 判定为线下）时只保留站上该均线的板块参与 RSRS 排序；"
@@ -343,7 +344,7 @@ def main() -> int:
                          "传 0 = 动量必须为正，否则当期空仓（熊市里动量都向下的板块不值得买）")
     ap.add_argument("--bear-rank", default="rsrs", choices=["rsrs", "slope", "both"],
                     help="熊市里板块排序依据：rsrs = RSRS 分数（默认）；slope = 加权回归斜率"
-                         "（近期权重更高，归一化成 %/交易日），直接衡量板块本身在不在涨；"
+                         "（近期权重更高，归一化成 %%/交易日），直接衡量板块本身在不在涨；"
                          "both = 双条件，必须同时进两个榜单的前 --bear-intersect-top 名")
     ap.add_argument("--bear-slope-window", type=int, default=20,
                     help="--bear-rank slope/both 的回归窗口（交易日）")
@@ -361,376 +362,211 @@ def main() -> int:
                     help="调仓日相对锚点（默认月末最后交易日）前移几个交易日；"
                          "1 = 用月末倒数第二个交易日调仓（RSRS、CV 窗口、买入价全部随之移动）")
     ap.add_argument("--regime-ma", type=int, default=0,
-                    help="用 SPY 与 N 日均线判定牛熊：线上牛市、线下熊市（0 = 不启用）。"
-                         "启用后牛市用多头排列、熊市改用空头排列（或空仓，见 --regime-bear）")
+                    help="用 SPY 与 N 日均线判定牛熊：线上牛市、线下熊市（0 = 不启用）")
     ap.add_argument("--regime-bear", default="nofilter",
                     choices=["nofilter", "downtrend", "cash"],
                     help="熊市中的处理：nofilter = 不做多头筛选，直接取 CV 第一名（默认）；"
                          "downtrend = 改买空头排列的票；cash = 空仓")
     ap.add_argument("--regime-window", type=int, default=0,
                     help="牛熊判定用「过去 N 个交易日」的统计而非当日单点：0/1 = 只看当日（旧口径）；"
-                         "21 = 过去一个月。单日跌破均线不再直接判熊，避免在均线附近反复横跳")
+                         "21 = 过去一个月")
     ap.add_argument("--regime-bear-ratio", type=float, default=0.5,
                     help="配合 --regime-window：过去 N 日里 SPY 低于均线的天数占比 ≥ 该值才算熊市"
-                         "（默认 0.5）。占比越高越迟钝，1.0 = 整段时间都在线下才判熊")
+                         "（默认 0.5）")
     ap.add_argument("--turn-rank", type=int, default=1,
                     help="--pick turn 时取第几名（1 = 换手率最高）")
     ap.add_argument("--turn-rank-mode", default="abs", choices=["abs", "ratio"],
-                    help="个股（板块内）排序口径：abs = 20 日均换手率（默认，旧口径）；"
-                         "ratio = turn20 × (turn20 / turn120) = turn20^2/turn120，"
-                         "即绝对换手率乘以「相对自身半年常态的放大倍数」，降序取前 N")
+                    help="个股排序口径：abs = 20 日均换手率（默认）；"
+                         "ratio = turn20 × (turn20 / turn120) = turn20^2/turn120")
     ap.add_argument("--cv-lag", type=int, default=0,
-                    help="--pick dvolcv/dvolcvh 时，CV 窗口截止日相对信号日滞后的交易日数；"
-                         "0 = 含信号日当天（默认），1 = 只用信号日之前的数据")
+                    help="--pick dvolcv/dvolcvh 时，CV 窗口截止日相对信号日滞后的交易日数")
     ap.add_argument("--stop-loss", type=float, default=0.0,
-                    help="个股止损阈值（如 0.3 = 相对买入价跌 30%% 收盘割肉），0 = 不止损；"
-                         "止损后当期空仓到下一个调仓日")
+                    help="个股止损阈值（如 0.3 = 相对买入价跌 30%% 收盘割肉），0 = 不止损")
+    ap.add_argument("--stop-ma20", type=int, default=0,
+                    help="均线止损（0 = 关闭；填 20 = 用 MA20）。买点收盘在均线上方时："
+                         "前一日收盘已跌破、且当日收盘仍未收回 → 当日收盘止损；买点在线下时："
+                         "止损价 = min(买入价 × (1 - stop_pct), 买入日前一交易日布林带下轨)")
+    ap.add_argument("--stop-pct", type=float, default=0.07,
+                    help="--stop-ma20 里「买点在均线下方」时的固定比例止损（默认 0.07 = 7%%）")
+    ap.add_argument("--stop-repick-days", type=int, default=10,
+                    help="--stop-ma20 的再选股窗口：止损发生在持有期前 N 个交易日（默认 10）"
+                         "才允许次日重新选股；--stop-repick-dom > 0 时改用日历日判断")
+    ap.add_argument("--stop-repick-dom", type=int, default=0,
+                    help="止损日在该自然月第 N 日之前（day < N，如 11 = 11 号之前）才允许"
+                         "割肉后继续选股；0 = 用 --stop-repick-days 的交易日口径。"
+                         "重选一律排除刚止损的那只票")
     ap.add_argument("--turn-cap", type=float, default=0.0,
-                    help="20 日均换手率上限，超过的票当期不参与排序（0 = 不限）。"
-                         "用于剔除分母异常导致的高换手票（如 ECHO 2025 年后出现 100%%+ 的日换手）")
+                    help="20 日均换手率上限，超过的票当期不参与排序（0 = 不限）")
     ap.add_argument("--turn-tail", type=float, default=0.0,
-                    help="信号日当天换手率的折算系数（0 = 不折算）。调仓在收盘前 30 分钟内完成，"
-                         "当天量能只走完一部分，实测 15:30 时点约为日线口径的 0.46，"
-                         "推荐 0.48；只作用于 20 日窗口里的信号日当天那一项")
-    ap.add_argument("--exclude", default="",
-                    help="逗号分隔的代码，整只从候选池剔除（如 ECHO 这种换手率序列不可信的票）")
-    ap.add_argument("--pool-cutoff", default="",
-                    help="只允许该日期之前已有行情的票进候选池（YYYY-MM-DD）。用于把"
-                         "「回测期内才出现/才被纳入指数」的票挡在外面，与全池结果一起构成"
-                         "指数调入调出影响的区间")
-    ap.add_argument("--pool-mode", default="snapshot", choices=["snapshot", "mcap", "pit"],
-                    help="候选池口径：snapshot = 今天的成分股名单回测过去（默认，含幸存者偏差）；"
-                         "mcap = 每个调仓日按 point-in-time 市值排名重建 top N 池，近似还原"
-                         "当时的成分股；pit = 用 S&P 官方公告的调入调出记录重建每期真实名单"
-                         "（2020-09 之后才完整，更早无代码）")
+                    help="信号日当天换手率的折算系数（0 = 不折算），推荐 0.48")
     ap.add_argument("--min-mcap", type=float, default=0.0,
-                    help="最小市值门槛（亿美元），0 = 不限。剔除指数尾部小票：它们的"
-                         "换手率分母小、噪声大，且天然高换手，会让按换手率排序的策略"
-                         "系统性偏向小市值票")
-    ap.add_argument("--mcap-shares", default="ws", choices=["ws", "static"],
-                    help="--min-mcap 的股本口径：ws = 与实盘一致（5 日反推→SEC，逐日无前视，默认）；"
-                         "static = 旧口径（全样本中位数+今日快照，含前视，仅作对照）")
-    ap.add_argument("--pool-top", type=int, default=500,
-                    help="--pool-mode mcap 时的池子容量（标普 500 约 500 只）")
-    ap.add_argument("--pool-shares", default="current", choices=["current", "sec"],
-                    help="--pool-mode mcap 算市值用的股本：current = universe 快照的当前股本"
-                         "（全市场覆盖，复权价 × 当前股本）；sec = 只在有 SEC 申报股本的"
-                         "501 只里排名（无过滤效果，仅对照）")
-    ap.add_argument("--data-source", default="local", choices=["local", "crsp"],
-                    help="行情/换手率/市值/成分股的数据源：local = yfinance 行情 + westock 换手率 + "
-                         "快照市值（旧口径）；crsp = 买来的标普 500 标准数据（PIT 成分、真实股本与市值）")
-    ap.add_argument("--crsp-scope", default="all", choices=["all", "pool", "metrics"],
-                    help="只用 crsp 数据源的哪一部分（做归因实验用）：all = 成分股+换手率+市值+价格；"
-                         "pool = 只把成分股换成 PIT；metrics = 只换换手率/市值/价格，池子仍用快照")
+                    help="最小市值门槛（亿美元，池层 DlyCap 口径），0 = 不限")
+    ap.add_argument("--exclude", default="",
+                    help="逗号分隔的 ticker 或 security_id，整只从候选池剔除")
+    ap.add_argument("--exclude-sectors", default="XLRE",
+                    help="从板块层整体剔除的 ETF，逗号分隔（默认 XLRE：房地产，与实盘不一致，"
+                         "且 3 年里有两年跑输 SPY）。空字符串 = 11 个板块全用")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
 
     sn = args.sn or args.n
     sm = args.sm or args.m
-    # 熊市「不分板块」模式：全市场按换手率取前 N，只在这 N 只里找第一只多头个股
     bear_turn5 = args.regime_ma > 0 and args.bear_pick == "turn5"
-    end = pd.Timestamp(args.end)
     start = pd.Timestamp(args.start)
+    pool_end = pool.last_date()
+    end = pd.Timestamp(args.end) if args.end else pool_end
+    if end > pool_end:
+        print(f"⚠ --end {end.date()} 超过池内数据边界 {pool_end.date()}，已截断"
+              f"（池层只到 CRSP 数据截止日，不再用本地行情接续）")
+        end = pool_end
+
+    # 板块层可整体剔除某些 ETF（默认去掉 XLRE）；被剔除板块的成分股一并移出候选池，
+    # 否则会出现「板块榜里没有它、但个股仍可能被熊市 turn5 挑中」的口径漏洞。
+    drop_sec = {s.strip().upper() for s in str(args.exclude_sectors).split(",") if s.strip()}
+    bad_sec = sorted(drop_sec - set(SECTOR_ETFS))
+    if bad_sec:
+        raise SystemExit(f"--exclude-sectors 里有不认识的 ETF：{', '.join(bad_sec)}")
+    active_etfs = [s for s in SECTOR_ETFS if s not in drop_sec]
+    if not active_etfs:
+        raise SystemExit("--exclude-sectors 把板块全删了")
+    if drop_sec:
+        print(f"板块层剔除 {'/'.join(sorted(drop_sec))}：只用 {len(active_etfs)} 个板块 "
+              f"({' '.join(active_etfs)})，这些板块的成分股也一并移出候选池")
+
+    # 预热：RSRS + 均线；strong 还要看 MA200
+    slope_wins = parse_slope_spec(args.slope_mas, args.stack_slope)
     warm = max(args.n + args.m, sn + sm) * 2 + 40
-    # 强化趋势要看 MA200，按「日历日 ≈ 交易日 × 1.6」放预热，否则启动初期整段是 NaN，
-    # 会被判成「都不满足趋势」而全程空仓——那是参数不足，不是策略结论。
     if args.trend_mode == "strong":
-        trend_w = max([args.trend_above, args.stack_slope]
+        trend_w = max([args.trend_above] + [v for v in slope_wins.values() if v > 0]
                       + [int(x) for x in str(args.trend_stack).split(",") if x.strip()]
                       + [int(x) for x in str(args.trend_cross).split(",") if x.strip()])
         warm = max(warm, int(trend_w * 1.6) + 60)
-    load_start = (start - pd.DateOffset(days=warm)).strftime("%Y-%m-%d")
-    use_crsp = args.data_source == "crsp"
-    use_crsp_pool = use_crsp and args.crsp_scope in ("all", "pool")
-    use_crsp_metrics = use_crsp and args.crsp_scope in ("all", "metrics")
-    if use_crsp and not crsp.available():
-        raise SystemExit("CRSP 数据不存在：先跑 python -m scripts.import_crsp_sp500")
 
-    members = load_members()
-    sec_of = dict(zip(members["symbol"], members["sector_etf"]))
-    mcap_of = dict(zip(members["symbol"], members["mcap"]))
-    stocks = list(members["symbol"])
-    pit_ev = None
-    pit_anchor: set[str] = set()
-    if use_crsp_pool:
-        # 成分股改用 CRSP 的当期名单：窗口内当过成分的所有票（含后来被剔除、退市的），
-        # 这才是「当时能买到」的池子；今天的 503 只快照含 58 只当时还没进指数的票。
-        crsp_win = crsp.symbols_in_window(start, end)
-        smap = crsp.sector_map(crsp_win)
-        sec_of.update(dict(zip(smap["symbol"], smap["sector_etf"])))
-        stocks = list(crsp_win)
-        n_sic = int((smap["src"] == "sic").sum())
-        n_gics = int((smap["src"] == "gics").sum())
-        print(f"--data-source crsp：窗口内成分 {len(stocks)} 只"
-              f"（{n_gics} 只用手工 GICS 补，{n_sic} 只按 SIC 近似）")
-    if args.pool_mode == "pit":
-        pit_ev = load_sp500_change_events()
-        pit_anchor = set(stocks)
-        # 已被剔除出指数的票不在当前 holdings 里，没有板块归属；用公告里的 GICS 板块补。
-        gics = (pit_ev.sort_values("effective_date")
-                .drop_duplicates("symbol", keep="last").set_index("symbol")["gics_sector"])
-        filled = 0
-        for sym, g in gics.items():
-            if sym not in sec_of:
-                etf = GICS_TO_ETF.get(str(g).strip())
-                if etf:
-                    sec_of[sym] = etf
-                    filled += 1
-        # 面板里必须包含「回测期内被剔除」的票，否则它永远买不到（这正是要修的偏差）
-        inwin = set(pit_ev.loc[pit_ev["effective_date"] >= start, "symbol"])
-        extra = sorted((inwin | pit_anchor) - set(stocks))
-        stocks = list(dict.fromkeys(stocks + extra))
-        print(f"--pool-mode pit：锚点 {len(pit_anchor)} 只，补入期内被剔除/新增 {len(extra)} 只"
-              f"（{filled} 只用公告 GICS 板块补齐归属）")
-    if args.exclude:
-        drop = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
-        hit = sorted(set(stocks) & drop)
-        stocks = [s for s in stocks if s not in drop]
-        print(f"--exclude 剔除 {len(hit)} 只：{' '.join(hit)}")
-    if args.pool_cutoff:
-        # 只在 cutoff 之前就已有行情的票才进候选池。用途：把「回测期内才出现/才被纳入」的票
-        # 挡在外面，得到「期初固定池」的保守结果，用来量指数调入调出的影响上界。
-        cutoff = pd.Timestamp(args.pool_cutoff)
-        con = store.duckdb_conn()
-        first = con.execute(
-            "SELECT symbol, min(date) AS first_date FROM bars GROUP BY 1").fetch_df()
-        con.close()
-        first["first_date"] = pd.to_datetime(first["first_date"])
-        early = set(first.loc[first["first_date"] <= cutoff, "symbol"])
-        late = sorted(set(stocks) - early)
-        stocks = [s for s in stocks if s in early]
-        print(f"--pool-cutoff {cutoff.date()}：剔除 {len(late)} 只在期后才出现的票："
-              f"{' '.join(late[:30])}{' ...' if len(late) > 30 else ''}")
-    print(f"成分股 {len(stocks)} 只在本地行情池内（11 板块，快照 2026-11-11）")
+    # --exclude 同时接受 ticker 与 security_id（ticker 兼容 BRK / BRK-B 两种写法）
+    tick_all = pool.display_tickers()
+    _ALIAS = {"BRK": "BRK-B", "BF": "BF-B"}
 
-    etf_syms = SECTOR_ETFS + [BENCH]
-    end_s = end.strftime("%Y-%m-%d")
-    if use_crsp_metrics:
-        # ETF 仍用本地行情（CRSP 只覆盖标普 500 成分股），个股用 CRSP 自己的复权价
-        def _both(field: str, crsp_field: str) -> pd.DataFrame:
-            left = store.load_panel(field=field, symbols=etf_syms, start=load_start, end=end_s)
-            right = crsp.panel(crsp_field, stocks, load_start, end_s)
-            return pd.concat([left, right], axis=1).sort_index().ffill()
+    def _norm_tick(t: str) -> str:
+        k = str(t).upper().replace(".", "-").strip()
+        return _ALIAS.get(k, k)
 
-        hi, lo, px = _both("high", "high"), _both("low", "low"), _both("adj_close", "adj_close")
-    else:
-        syms = etf_syms + stocks
-        hi = store.load_panel(field="high", symbols=syms, start=load_start,
-                              end=end_s).sort_index().ffill()
-        lo = store.load_panel(field="low", symbols=syms, start=load_start,
-                              end=end_s).sort_index().ffill()
-        px = store.load_panel(field="adj_close", symbols=syms, start=load_start,
-                              end=end_s).sort_index().ffill()
+    tick2id = {}
+    for i, t in tick_all.items():
+        tick2id[_norm_tick(t)] = str(i)
+        tick2id[str(t).upper()] = str(i)
+    id_set = set(tick_all.index.astype(str))
+    excl: set[str] = set()
+    for tok in (s.strip() for s in args.exclude.split(",")):
+        if not tok:
+            continue
+        key = tok.upper()
+        if key in tick2id:
+            excl.add(tick2id[key])
+        elif key in id_set:
+            excl.add(key)
+        else:
+            print(f"⚠ --exclude {tok}：池里找不到这个 ticker / security_id，忽略")
 
-    # 区间内完全没有行情的成分股（多为区间之后才上市/拆分出来的票）直接剔除，
-    # 否则 px[stocks] / hi[stocks] 会因列缺失报 KeyError。
-    have = [s for s in stocks if s in px.columns and s in hi.columns and s in lo.columns]
-    if len(have) < len(stocks):
-        print(f"区间内无行情的成分股 {len(stocks) - len(have)} 只已剔除："
-              f"{' '.join(sorted(set(stocks) - set(have)))}")
-    stocks = have
+    data = load_pool(start, end, warm, excl, active_etfs)
+    ids, cal = data["ids"], data["cal"]
+    px, hi, lo = data["px"], data["hi"], data["lo"]
+    mask, mcap, turn = data["mask"], data["mcap"], data["turn"]
+    sec_of, sec_src, tick_of = data["sec_of"], data["sec_src"], data["tick_of"]
+    stocks = ids
+    T = lambda s: tick_of.get(s, s)  # noqa: E731  security_id → 展示用 ticker
 
-    etf_rsrs = rsrs_panel_fast(hi[SECTOR_ETFS], lo[SECTOR_ETFS], args.n, args.m, args.spec)
+    n_src: dict[str, int] = {}
+    for s in stocks:
+        n_src[sec_src[s]] = n_src.get(sec_src[s], 0) + 1
+    daily_n = mask.loc[cal >= start].sum(axis=1)   # 预热段的 cal 不算，只统计回测区间
+    print(f"数据源 sp500_pool：窗口内**并集** {len(stocks)} 只 "
+          f"（含期内新进/被剔除的，防幸存者偏差）/ {len(cal)} 个交易日 "
+          f"({cal[0].date()} ~ {cal[-1].date()})")
+    print(f"  任一交易日真正在指数内的只有 {int(daily_n.median())} 只"
+          f"（min {int(daily_n.min())} / max {int(daily_n.max())}），选股只在当日成分里挑")
+    print(f"  板块归属：{' / '.join(f'{k} {v}' for k, v in sorted(n_src.items()))}"
+          f"（holdings 快照优先，缺的按 GICS/SIC 补）")
+    print(f"  预热 {warm} 自然日（load_start {data['load_start']}）；"
+          f"清洗层自带外部预热段，新纳入的票不再需要前端补价")
+
+    etf_rsrs = rsrs_panel_fast(hi[active_etfs], lo[active_etfs], args.n, args.m, args.spec)
     print(f"板块层 RSRS 完成 {etf_rsrs.shape}")
     stock_rsrs = rsrs_panel_fast(hi[stocks], lo[stocks], sn, sm, args.spec)
     print(f"个股层 RSRS 完成 {stock_rsrs.shape}（N={sn}, M={sm}）")
 
-    cal = px.index
     bench = px[BENCH]
-    # 带上 SPY：熊市兜底买 SPY 时策略收益和对照都用它这一列
-    ret_etf = px[SECTOR_ETFS + [BENCH]].pct_change()
+    ret_etf = px[active_etfs + [BENCH]].pct_change()
     ret_stk = px[stocks].pct_change()
 
-    # 逐期成分股池（--pool-mode mcap 时启用）。默认 snapshot = 用今天的名单回测过去。
-    pool_mask = None
-    if use_crsp_pool:
-        # CRSP 自带成分区间，直接给逐日 PIT 掩码；不需要再按公告回放
-        pool_mask = crsp.membership_mask(cal, stocks)
-        for d in (cal[0], cal[len(cal) // 2], cal[-1]):
-            print(f"  {d.date()} 在池 {int(pool_mask.loc[d].sum())} 只（CRSP PIT）")
-    elif args.pool_mode == "mcap":
-        pool_mask = mcap_pool_mask(stocks, cal, load_start, end.strftime("%Y-%m-%d"),
-                                   args.pool_top, args.pool_shares)
-    elif args.pool_mode == "pit":
-        print(f"--pool-mode pit：按官方公告重建逐日名单（{len(pit_ev)} 条事件）")
-        pool_mask = pit_pool_mask(stocks, cal, pit_ev, pit_anchor)
-
-    # 最小市值过滤。小市值票的换手率分母（股本）小、噪声大，而且这类票天然高换手，
-    # 会让「按换手率排序」系统性偏向指数尾部的小票（NCLH 市值 65~100 亿美元、
-    # 日换手 5%，长期排在 XLY 第一）。这是口径修正，不是调参。
-    mcap_panel = None
-    if use_crsp_metrics and (args.min_mcap > 0 or bear_turn5):
-        # CRSP 直接给当期市值（DlyCap），不需要反推股本，也没有前视
-        mcap = crsp.mcap_panel(stocks, load_start, end.strftime("%Y-%m-%d")).reindex(cal)
-        mcap_panel = mcap
-        if args.min_mcap > 0:
-            ok = (mcap > args.min_mcap * 1e8) | mcap.isna()
-            ok = ok.reindex(columns=stocks).fillna(True).astype(bool)
-            gone = sorted(s for s in stocks if not bool(ok[s].any()))
-            pool_mask = ok if pool_mask is None else (pool_mask & ok)
-            print(f"--min-mcap {args.min_mcap:.0f} 亿美元（口径 crsp）："
-                  f"全程不达标的 {len(gone)} 只移出候选 "
-                  f"({' '.join(gone[:16])}{' ...' if len(gone) > 16 else ''})")
-    elif args.min_mcap > 0 or bear_turn5:
-        vol_m = store.load_panel(field="volume", symbols=stocks, start=load_start,
-                                 end=end.strftime("%Y-%m-%d")).sort_index()
-        px_c = store.load_panel(field="close", symbols=stocks, start=load_start,
-                                end=end.strftime("%Y-%m-%d")).sort_index()
-        tv_all = pd.read_parquet(ROOT / "data" / "curated" / "fundamentals"
-                                 / "turnover_daily.parquet")
-        tv_p = tv_all.pivot(index="date", columns="symbol", values="turnover").sort_index()
-        cols_m = [c for c in stocks if c in vol_m.columns and c in px_c.columns]
-        implied = (vol_m[cols_m] / tv_p.reindex(index=vol_m.index, columns=cols_m)
-                   .where(lambda x: x > 0)).replace([np.inf, -np.inf], np.nan)
+    # 最小市值门槛：池层 DlyCap 是当期真实市值，没有股本反推/快照兜底的前视问题
+    pool_mask = mask
+    if args.min_mcap > 0:
         thr = args.min_mcap * 1e8
-        if args.mcap_shares == "static":
-            # 旧口径（含前视，仅作对照）：全样本中位数 + universe 快照兜底
-            sh = implied.median()
-            uni_m = pd.read_parquet(universe.latest_file())
-            uni_m["symbol"] = uni_m["symbol"].astype(str).str.upper()
-            snap = (uni_m["market_cap"] / uni_m["price"]).replace([np.inf, -np.inf], np.nan)
-            snap.index = uni_m["symbol"].values
-            sh = sh.fillna(snap)
-            mcap = px_c[cols_m].mul(sh[cols_m], axis=1).reindex(cal).ffill()
-        else:
-            # 与实盘 quant.live.mcap 同口径（逐日、无前视）：
-            # ① 最近 5 个交易日 成交量÷换手率 的中位数（至少 3 个有效点）
-            # ② 缺失时用 SEC 申报股本（filed ≤ 当日，且不超过 400 天）
-            # 快照那一级历史上不可得（只有今天一份），回测不用
-            # 回测的 pit 池里有已调出/退市的票，换手率面板对它们有缺口（实盘池全是现成分股，无此问题）。
-            # 缺口处沿用「最近一次可信股本」最多 250 个交易日（只用过去，无前视），再退到 SEC，
-            # 否则这些小票会因「取不到市值→保留」而混进候选池
-            sh_ws = implied.rolling(5, min_periods=3).median().ffill(limit=250)
-            so_path = ROOT / "data" / "curated" / "fundamentals" / "shares_outstanding.parquet"
-            sh_t = sh_ws
-            if so_path.exists():
-                so = pd.read_parquet(so_path)
-                so["symbol"] = so["symbol"].astype(str).str.upper().str.replace(".", "-", regex=False)
-                so["filed"] = pd.to_datetime(so["filed"], errors="coerce")
-                so = so[(so["val"] > 1000) & so["filed"].notna() & so["symbol"].isin(cols_m)]
-                so = so.sort_values("filed").groupby(["filed", "symbol"]).tail(1)
-                idx = vol_m.index.union(pd.DatetimeIndex(so["filed"].unique())).sort_values()
-                val = so.pivot(index="filed", columns="symbol", values="val").reindex(idx).ffill()
-                fdate = so.assign(f=so["filed"]).pivot(index="filed", columns="symbol", values="f")
-                fdate = fdate.reindex(idx).ffill()
-                age = pd.DataFrame(idx.values[:, None] - fdate.values, index=idx, columns=fdate.columns)
-                val = val.where(age <= pd.Timedelta(days=400))
-                val = val.reindex(index=vol_m.index, columns=cols_m)
-                sh_t = sh_ws.where(sh_ws.notna(), val)
-            # ④ 仍缺（换手率面板整段缺失，如 MTCH 2023-10~2025-09 不在面板内）：退到全样本中位数。
-            #    这一级含前视，但只补数据缺口，股本变化慢，且比「取不到→保留」更接近实盘
-            sh_t = sh_t.fillna(implied.median())
-            mcap = (px_c[cols_m] * sh_t).reindex(cal)     # 不 ffill：当日取不到就是未知（保留）
-        mcap_panel = mcap        # 熊市 turn5 复核市值时复用同一份面板
-        if args.min_mcap > 0:
-            ok = (mcap > thr) | mcap.isna()      # 拿不到市值的保留，靠换手率那一步自然淘汰
-            ok = ok.reindex(columns=stocks).fillna(True).astype(bool)
-            gone = sorted(s for s in stocks if not bool(ok[s].any()))
-            pool_mask = ok if pool_mask is None else (pool_mask & ok)
-            print(f"--min-mcap {args.min_mcap:.0f} 亿美元（股本口径 {args.mcap_shares}）："
-                  f"全程不达标的 {len(gone)} 只移出候选 "
-                  f"({' '.join(gone[:16])}{' ...' if len(gone) > 16 else ''})")
+        ok = ((mcap > thr) | mcap.isna()).reindex(columns=stocks).fillna(True).astype(bool)
+        gone = sorted(s for s in stocks if not bool(ok[s].any()))
+        pool_mask = ok if pool_mask is None else (pool_mask & ok)
+        print(f"--min-mcap {args.min_mcap:.0f} 亿美元（池层 DlyCap）：全程不达标的 "
+              f"{len(gone)} 只移出候选（{' '.join(T(s) for s in gone[:16])}"
+              f"{' ...' if len(gone) > 16 else ''}）")
 
-    def in_pool(sym: str, dt_: pd.Timestamp) -> bool:
+    for d in (cal[0], cal[len(cal) // 2], cal[-1]):
+        print(f"  {d.date()} 在池 {int(pool_mask.loc[d].sum())} 只（PIT）")
+
+    def in_pool(sid: str, dt_: pd.Timestamp) -> bool:
         if pool_mask is None:
             return True
         try:
-            return bool(pool_mask.at[dt_, sym])
+            return bool(pool_mask.at[dt_, sid])
         except KeyError:
             return False
 
-    # 换手率 = 成交量 / 流通股本。本地无股本序列，用 universe 快照的 市值/价格 推算，
-    # 即假设股本在回测期内不变（前视 + 近似，见 PROGRESS 记录）。
-    turn_rate = None
-    turn_rate_120 = None      # 120 日均换手率：--turn-rank-mode ratio 用的「自身常态」
-    turn_score = None         # 实际参与排序的面板（abs = turn20；ratio = turn20²/turn120）
-    dvol = None
-    dvol_cv = None
+    # ------------------------------------------------------------------
+    # 换手率 / 成交额面板（池层逐日 turnover = 成交量 ÷ 当日总股本）
+    # ------------------------------------------------------------------
+    turn_rate = turn_rate_120 = turn_score = None
+    dvol = dvol_cv = None
     if (args.pick in ("turn", "dvol", "dvolcv", "dvolcvh", "cvdown", "turnma")
             or bear_turn5):
-        vol = (crsp.panel("volume", stocks, load_start, end.strftime("%Y-%m-%d")).sort_index()
-               if use_crsp_metrics else
-               store.load_panel(field="volume", symbols=stocks, start=load_start,
-                                end=end.strftime("%Y-%m-%d")).sort_index())
+        vol = pool.panel("volume", stocks, data["load_start"],
+                         end.strftime("%Y-%m-%d")).reindex(cal)
         if args.pick in ("turn", "turnma") or bear_turn5:
-            if args.turn_shares == "snapshot":
-                # 旧口径：用 universe 快照的 市值/价格 推算股本（前视，仅作对照）
-                uni = pd.read_parquet(universe.latest_file())
-                uni["symbol"] = uni["symbol"].astype(str).str.upper()
-                sh = (uni["market_cap"] / uni["price"]).replace([np.inf, -np.inf], np.nan)
-                shares = pd.Series(sh.values, index=uni["symbol"]).dropna()
-                shares = shares[shares > 0]
-                cols = [c for c in stocks if c in shares.index and c in vol.columns]
-                turn_rate = (vol[cols].rolling(20, min_periods=10).mean()
-                             .div(shares[cols], axis=1).reindex(cal).ffill())
-                if args.turn_rank_mode == "ratio":
-                    turn_rate_120 = (vol[cols].rolling(120, min_periods=60).mean()
-                                     .div(shares[cols], axis=1).reindex(cal).ffill())
-                print(f"换手率面板完成 {turn_rate.shape}（旧口径：股本由当前市值/价格推算，"
-                      f"共 {len(cols)} 只）")
+            raw = turn.reindex(cal).ffill()
+            cols = [c for c in stocks if c in raw.columns]
+            missing = sorted(set(stocks) - set(cols))
+            raw = raw[cols]
+            if args.turn_tail > 0:
+                # 调仓在收盘前 30 分钟内完成，信号日当天的成交量只走完一部分
+                cnt = raw.notna().rolling(20, min_periods=1).sum()
+                s20 = raw.rolling(20, min_periods=1).sum()
+                turn_rate = ((s20 - raw + args.turn_tail * raw) / cnt).where(cnt >= 10)
+                print(f"信号日换手率按尾盘系数 {args.turn_tail:.2f} 折算")
             else:
-                # 数据源口径：腾讯自选股日 K 的换手率字段。注意它对美股是「成交量/总股本」
-                # 口径（实测 WMT/COIN/RDDT 全部对得上总股本），保留作对照，不是流通股本。
-                if use_crsp_metrics:
-                    # CRSP 口径：成交量 ÷ 当日总股本，逐日真实值
-                    panel = crsp.turnover_panel(stocks, load_start, end.strftime("%Y-%m-%d"))
-                else:
-                    path = (ROOT / "data" / "curated" / "fundamentals"
-                            / "turnover_daily.parquet")
-                    if not path.exists():
-                        raise SystemExit(f"换手率面板不存在（应由 data 分支提供）：{path}")
-                    tv = pd.read_parquet(path)
-                    panel = tv.pivot(index="date", columns="symbol",
-                                     values="turnover").sort_index()
-                cols = [c for c in stocks if c in panel.columns]
-                missing = sorted(set(stocks) - set(cols))
-                raw = panel[cols].reindex(cal).ffill()
+                turn_rate = raw.rolling(20, min_periods=10).mean()
+            if args.turn_rank_mode == "ratio":
+                cnt120 = raw.notna().rolling(120, min_periods=1).sum()
+                s120 = raw.rolling(120, min_periods=1).sum()
                 if args.turn_tail > 0:
-                    # 调仓在收盘前 30 分钟内完成，信号日当天的成交量此时只走完一部分
-                    # （实测 15:30 时点约完成日线口径的 45.6%），把当天这一项按系数折算，
-                    # 其余 19 天仍用完整日值：sum(20) - today + c × today。
-                    cnt = raw.notna().rolling(20, min_periods=1).sum()
-                    s20 = raw.rolling(20, min_periods=1).sum()
-                    turn_rate = ((s20 - raw + args.turn_tail * raw) / cnt).where(cnt >= 10)
-                    print(f"信号日换手率按尾盘系数 {args.turn_tail:.2f} 折算")
+                    turn_rate_120 = ((s120 - raw + args.turn_tail * raw)
+                                     / cnt120).where(cnt120 >= 60)
                 else:
-                    turn_rate = raw.rolling(20, min_periods=10).mean()
-                if args.turn_rank_mode == "ratio":
-                    # 120 日的「常态」基准：同一个尾盘折算口径（当日那一项乘系数），
-                    # 120 天窗口里当日只占 1/120，实际影响 < 0.5%，但口径统一更好解释。
-                    cnt120 = raw.notna().rolling(120, min_periods=1).sum()
-                    s120 = raw.rolling(120, min_periods=1).sum()
-                    if args.turn_tail > 0:
-                        turn_rate_120 = ((s120 - raw + args.turn_tail * raw)
-                                         / cnt120).where(cnt120 >= 60)
-                    else:
-                        turn_rate_120 = raw.rolling(120, min_periods=60).mean()
-                    print(f"120 日均换手率面板完成 {turn_rate_120.shape}（自身常态基准）")
-                src_name = "CRSP 成交量/总股本" if use_crsp_metrics else "westock 日 K 换手率"
-                print(f"换手率面板完成 {turn_rate.shape}（{src_name}，20 日均值，"
-                      f"共 {len(cols)} 只；无数据 {len(missing)} 只）")
-                if missing:
-                    print(f"  无换手率数据已剔除：{' '.join(missing[:20])}"
-                          f"{' ...' if len(missing) > 20 else ''}")
+                    turn_rate_120 = raw.rolling(120, min_periods=60).mean()
+                print(f"120 日均换手率面板完成 {turn_rate_120.shape}（自身常态基准）")
+            print(f"换手率面板完成 {turn_rate.shape}（池层 成交量/总股本，20 日均值，"
+                  f"共 {len(cols)} 只；无数据 {len(missing)} 只）")
+            if missing:
+                print(f"  无换手率数据已剔除：{' '.join(T(s) for s in missing[:20])}"
+                      f"{' ...' if len(missing) > 20 else ''}")
             if args.turn_cap > 0:
-                # 20 日均换手率超过上限的票，当期直接不参与排序（分母异常 / 极端事件）。
                 n_cap = int((turn_rate > args.turn_cap).sum().sum())
                 turn_rate = turn_rate.mask(turn_rate > args.turn_cap)
                 print(f"换手率上限 {args.turn_cap:.0%}：剔除 {n_cap} 个票日")
             if args.turn_noise > 0:
-                # 稳健性扰动：给每只票每天的换手率乘一个对数正态噪声（sigma = turn_noise），
-                # 模拟「分母有 ±sigma 量级误差」，看选股与收益对这个扰动的敏感度。
                 rng = np.random.default_rng(args.seed)
                 noise = rng.normal(0.0, args.turn_noise, size=turn_rate.shape)
                 turn_rate = turn_rate * np.exp(pd.DataFrame(
                     noise, index=turn_rate.index, columns=turn_rate.columns))
                 print(f"换手率已注入噪声 sigma={args.turn_noise:.2f}（seed={args.seed}）")
             if args.turn_rank_mode == "ratio":
-                # 排序分 = 绝对换手率 × 相对自身常态的放大倍数
-                #        = turn20 × (turn20 / turn120) = turn20² / turn120
-                # 分子要求「本身就够活跃」，倍数要求「比它自己过去半年更活跃」：
-                # 常年高换手的票分母大、倍数小，会被压低；一次性脉冲把 120 日均值拉高后，
-                # 倍数也会回落，避免把「已经放完量」的票继续排在前面。
                 if turn_rate_120 is None:
                     raise SystemExit("--turn-rank-mode ratio 缺少 120 日均换手率面板")
                 turn_score = turn_rate ** 2 / turn_rate_120.where(turn_rate_120 > 0)
@@ -745,113 +581,135 @@ def main() -> int:
             if args.pick == "dvol":
                 dvol = (amt.rolling(20, min_periods=10).mean()
                         .reindex(cal).ffill())
-                print(f"成交额面板完成 {dvol.shape}（20 日均值，volume × adj_close，共 {len(cols)} 只）")
+                print(f"成交额面板完成 {dvol.shape}（20 日均值，volume × adj_close，"
+                      f"共 {len(cols)} 只）")
             else:
-                # 变异系数 = 20 日成交额标准差 / 20 日均值，衡量成交额稳定度（越低越稳）
                 mean_ = amt.rolling(20, min_periods=10).mean()
                 std_ = amt.rolling(20, min_periods=10).std()
                 dvol_cv = (std_ / mean_.where(mean_ > 0)).reindex(cal).ffill()
                 if args.cv_lag:
                     dvol_cv = dvol_cv.shift(args.cv_lag)
                 print(f"成交额变异系数面板完成 {dvol_cv.shape}"
-                      f"（20 日 std/mean，volume × adj_close，窗口滞后 {args.cv_lag} 个交易日，"
-                      f"共 {len(cols)} 只）")
+                      f"（20 日 std/mean，窗口滞后 {args.cv_lag} 个交易日，共 {len(cols)} 只）")
 
-    # 下跌趋势判定（cvdown 用）：收盘价低于 N 日均线，且均线本身在 M 个交易日内下行。
-    # 只用信号日及之前的数据，不含未来。
+    # ------------------------------------------------------------------
+    # 趋势面板
+    # ------------------------------------------------------------------
     ma_t = px[stocks].rolling(args.trend_ma, min_periods=max(5, args.trend_ma // 2)).mean()
     ma_t_prev = ma_t.shift(args.trend_slope)
     ma_group = [int(x) for x in str(args.trend_mas).split(",") if str(x).strip()]
     ma_panels = {w: px[stocks].rolling(w, min_periods=max(3, w // 2)).mean() for w in ma_group}
-    stack_group = [int(x) for x in str(args.trend_stack).split(",") if str(x).strip()]
+    stack_group = [int(x) for x in str(args.trend_stack).split(",") if x.strip()]
     stack_panels = {w: px[stocks].rolling(w, min_periods=max(3, w // 2)).mean() for w in stack_group}
 
-    # 强化趋势（--trend-mode strong）专用面板。均线斜率用「与 N 个交易日前比较」，
-    # 而不是拟合回归斜率：口径直观、不受窗口内跳空影响，也不会引入未来的点。
-    # 长期均线（MA200）用完整窗口 min_periods=w，不足 200 天一律 NaN——不做「半截均线」判定。
+    # 均线止损专用面板：止损均线 + 买入日的布林带下轨
+    stop_ma_p, stop_bb_low = None, None
+    if args.stop_ma20 > 0:
+        _sw = max(2, int(args.stop_ma20))
+        stop_ma_p = px[stocks].rolling(_sw, min_periods=max(5, _sw // 2)).mean()
+        _bw2 = max(2, int(args.bb_window))
+        _bm2 = px[stocks].rolling(_bw2, min_periods=max(10, _bw2 // 2)).mean()
+        _bs2 = px[stocks].rolling(_bw2, min_periods=max(10, _bw2 // 2)).std(ddof=0)
+        stop_bb_low = _bm2 - float(args.bb_mult) * _bs2
+        _repick_txt = (f"当月 {args.stop_repick_dom} 日之前止损 → 割肉后逐日再选股"
+                       f"（排除原票）" if args.stop_repick_dom > 0
+                       else f"前 {max(1, args.stop_repick_days)} 个交易日止损后次日再选股一次")
+        print(f"均线止损：MA{_sw}（买点在线上 → 前一日跌破 + 当日未收回，两日确认）；"
+              f"离线买入 → min(买入价 × {1.0 - args.stop_pct:.2f}, 前一日布林带下轨)；"
+              f"{_repick_txt}")
+    elif args.stop_loss > 0:
+        _repick_txt = (f"当月 {args.stop_repick_dom} 日之前止损 → 割肉后逐日再选股"
+                       f"（排除原票）" if args.stop_repick_dom > 0
+                       else f"前 {max(1, args.stop_repick_days)} 个交易日止损后次日再选股一次")
+        print(f"固定止损：收盘价相对买入价跌 {args.stop_loss:.1%} 当日收盘割；{_repick_txt}")
+
     strong = args.trend_mode == "strong"
-    slope_panels, above_panel, cross_panels, adx_p = {}, None, None, None
+    slope_panels, above_panel, cross_panels = {}, None, None
+    adx_p, pdi_p, mdi_p = None, None, None
+    near_high_p = pos_p = None
+    pos_lo, pos_hi = None, None
+    bb_ma, bb_sd, bb_zmax = None, None, None
+    pos_len = max(2, int(args.pos_len))
+    if str(args.pos_band).strip():
+        _pb = [float(x) for x in str(args.pos_band).replace("~", ",").split(",") if str(x).strip()]
+        if len(_pb) != 2 or not (0.0 <= _pb[0] < _pb[1] <= 1.0):
+            raise SystemExit(f"--pos-band 需要两个递增值且在 0~1 之间，收到 {args.pos_band!r}")
+        pos_lo, pos_hi = _pb
     cross_group = [int(x) for x in str(args.trend_cross).split(",") if x.strip()]
-    # 斜率闸只查 --slope-mas 列出的均线（默认 20,60）。MA5 的斜率一个交易日就能翻负，
-    # 会把「刚回踩、排列仍完好」的票全部否决——实测这是牛市空仓的主要来源。
-    slope_group = [int(x) for x in str(args.slope_mas).split(",") if str(x).strip()]
     if strong:
-        if args.stack_slope > 0:
-            for w in slope_group:
-                base = stack_panels.get(w)
-                if base is None:
-                    base = px[stocks].rolling(w, min_periods=max(3, w // 2)).mean()
-                slope_panels[w] = base - base.shift(args.stack_slope)
+        for w, win in slope_wins.items():
+            if win <= 0:
+                continue
+            base = stack_panels.get(w)
+            if base is None:
+                base = px[stocks].rolling(w, min_periods=max(3, w // 2)).mean()
+            slope_panels[w] = base - base.shift(win)
         if args.trend_above > 0:
             above_panel = px[stocks].rolling(args.trend_above,
                                              min_periods=args.trend_above).mean()
         if len(cross_group) == 2:
             cross_panels = [px[stocks].rolling(w, min_periods=w).mean() for w in cross_group]
-        if args.adx_min > 0:
-            adx_p = adx_panel(hi[stocks], lo[stocks], px[stocks], args.adx_len)
-        slope_txt = (f'，MA{"/".join(str(w) for w in slope_group)} 的 '
-                     f'{args.stack_slope} 日斜率为正'
-                     if args.stack_slope > 0 and slope_group else '')
-        print(f"强化趋势过滤：排列 {' > '.join(f'MA{w}' for w in stack_group)}"
-              f"{slope_txt}"
+        if args.adx_min > 0 or args.adx_dir:
+            adx_p, pdi_p, mdi_p = dmi_panels(hi[stocks], lo[stocks], px[stocks], args.adx_len)
+        if args.max_near_high > 0:
+            near_high_p = (hi[stocks].rolling(args.near_high_len,
+                                              min_periods=max(10, args.near_high_len // 2))
+                           .max())
+        if pos_lo is not None:
+            hi_n = hi[stocks].rolling(pos_len, min_periods=max(10, pos_len // 2)).max()
+            lo_n = lo[stocks].rolling(pos_len, min_periods=max(10, pos_len // 2)).min()
+            rng = (hi_n - lo_n).where(lambda d: d > 0)
+            pos_p = (px[stocks] - lo_n) / rng
+        if args.bb_delta > 0:
+            _bw = max(2, int(args.bb_window))
+            _bm = px[stocks].rolling(_bw, min_periods=max(10, _bw // 2)).mean()
+            _bs = px[stocks].rolling(_bw, min_periods=max(10, _bw // 2)).std(ddof=0)
+            bb_ma, bb_sd = _bm, _bs
+            bb_zmax = float(args.bb_mult) - float(args.bb_delta)
+        slope_txt = ("，" + "、".join(f"MA{w} 的 {win} 日斜率"
+                                     for w, win in slope_wins.items() if win > 0) + "为正"
+                     if any(v > 0 for v in slope_wins.values()) else "")
+        print(f"强化趋势过滤：排列 {' > '.join(f'MA{w}' for w in stack_group)}{slope_txt}"
               f"{f'，收盘 > MA{args.trend_above}' if args.trend_above > 0 else ''}"
               f"{f'，MA{cross_group[0]} > MA{cross_group[1]}' if cross_panels else ''}"
-              f"{f'，ADX({args.adx_len}) > {args.adx_min:g}' if adx_p is not None else ''}")
+              f"{f'，ADX({args.adx_len}) > {args.adx_min:g}' if adx_p is not None else ''}"
+              f"{'，+DI > -DI' if args.adx_dir else ''}"
+              f"{f'，距 {args.near_high_len} 日最高价 > {args.max_near_high:.1%}' if near_high_p is not None else ''}"
+              f"{f'，位置分位({pos_len}) 在 {pos_lo:.0%}~{pos_hi:.0%}' if pos_lo is not None else ''}"
+              f"{f'，布林 z <= {bb_zmax:g}' if bb_sd is not None else ''}")
 
-    # 牛熊判定：SPY 收盘与 120 日（可配）均线比较，线上 = 牛、线下 = 熊。
-    # --regime-window > 1 时改成「过去 N 日里跌破均线的天数占比」：均线附近单日穿越
-    # 不再直接翻转牛熊（2026-03 就是单日跌破被判熊，把后面 +54% 的那期让给了 ETF）。
+    # ------------------------------------------------------------------
+    # 牛熊 + 熊市板块排序
+    # ------------------------------------------------------------------
     spy_ma, bear_ratio = None, None
     if args.regime_ma > 0:
         spy_ma = px[BENCH].rolling(args.regime_ma,
                                    min_periods=max(20, args.regime_ma // 2)).mean()
         below = (px[BENCH] < spy_ma).astype(float).where(spy_ma.notna())
         win = max(1, args.regime_window)
-        bear_ratio = (below if win == 1
-                      else below.rolling(win, min_periods=win).mean())
+        bear_ratio = (below if win == 1 else below.rolling(win, min_periods=win).mean())
         print(f"牛熊判定：SPY vs MA{args.regime_ma}，"
               + (f"过去 {win} 日跌破占比 ≥ {args.regime_bear_ratio:.0%} 判熊"
                  if win > 1 else "当日跌破即判熊（旧口径）"))
         if bear_turn5:
-            print(f"熊市选股：不分板块，全市场市值 > {args.bear_turn_mcap:g} 亿美元的票按换手率"
-                  f"降序取前 {args.bear_turn_top} 只，买其中第一只满足多头趋势的")
-        if args.bear_refill:
-            print("熊市双榜补选：当期交集为空/动量不达标时，从下一个交易日起逐日重算双榜，"
-                  "命中即按当日收盘买入该板块 ETF；到下一个调仓日仍未命中则空仓")
-        if args.bear_lookback > 0:
-            print(f"熊市双榜回看：信号日交集为空时回看过去 {args.bear_lookback} 个交易日，"
-                  "取最近一次双榜同时满足的板块（仍按信号日收盘买入）")
+            print(f"熊市选股：不分板块，市值 > {args.bear_turn_mcap:g} 亿美元的票按换手率"
+                  f"降序取前 {args.bear_turn_top} 只")
 
-    # 熊市板块闸门：只留站上 MA(N) 的板块。熊市里板块普跌，但总有一两个在避险抱团
-    # （2022 的 XLE、2023 的 XLK），要求它们站在中期均线上方，才让它们进 RSRS 排序。
-    # 用完整窗口 min_periods=N，不足 N 天一律 NaN（不许「半截均线」放行）。
-    sec_ma = (px[SECTOR_ETFS].rolling(args.bear_sector_ma, min_periods=args.bear_sector_ma).mean()
+    sec_ma = (px[active_etfs].rolling(args.bear_sector_ma, min_periods=args.bear_sector_ma).mean()
               if args.bear_sector_ma > 0 else None)
-
-    # 熊市板块排序可换成加权斜率：RSRS 是 high~low 回归的 z-score，衡量「日内强弱关系」，
-    # 在单边下跌里会频繁换手；斜率直接看价格趋势本身，更贴合「哪个板块真的在涨」。
-    etf_slope = (weighted_slope_panel(px[SECTOR_ETFS], args.bear_slope_window)
+    etf_slope = (weighted_slope_panel(px[active_etfs], args.bear_slope_window)
                  if args.regime_ma > 0 and args.bear_rank in ("slope", "both") else None)
-    if etf_slope is not None:
-        print(f"熊市板块排序：加权斜率（窗口 {args.bear_slope_window} 日，%/交易日）"
-              + (f"，且必须与 RSRS 前 {args.bear_intersect_top} 名取交集"
-                 if args.bear_rank == "both" else ""))
 
     def is_bull(dt: pd.Timestamp) -> bool:
         if spy_ma is None:
             return True
         r = bear_ratio.at[dt] if dt in bear_ratio.index else np.nan
         if not np.isfinite(r):
-            # 样本不足（预热没铺满均线+统计窗口）：按牛市走常规链路，不当成熊市去乱买 ETF
             return True
         return bool(r < args.regime_bear_ratio)
 
     def pick_bear_etf(sec_pool: pd.Series) -> str:
-        """熊市里该买哪只板块 ETF：RSRS 最强、且（若设了下限）动量必须过关。
-
-        返回空串 = 当期空仓。熊市里最强板块的 RSRS 都是负的，说明连抱团的都没有，
-        这时候买 ETF 只是跟着大盘阴跌，不如空仓等信号。
-        """
+        """熊市里该买哪只板块 ETF：RSRS/斜率最强、且（若设了下限）动量必须过关。"""
         if sec_pool.empty:
             return ""
         top = str(sec_pool.index[0])
@@ -860,11 +718,7 @@ def main() -> int:
         return top
 
     def double_scores(dt_: pd.Timestamp) -> pd.Series:
-        """某一天的「RSRS 前 N ∩ 斜率前 N」序列（按 RSRS 降序），并套用 --bear-sector-ma 闸。
-
-        与信号日那段逻辑同口径，抽出来是为了给 --bear-refill 逐日重算用：交易日 dt_
-        的 RSRS、斜率、均线闸全部取当日值，不掺未来数据。
-        """
+        """某一天的「RSRS 前 N ∩ 斜率前 N」（按 RSRS 降序），并套用 --bear-sector-ma 闸。"""
         if dt_ not in etf_rsrs.index:
             return pd.Series(dtype=float)
         zs = etf_rsrs.loc[dt_].dropna().sort_values(ascending=False)
@@ -883,51 +737,87 @@ def main() -> int:
                        and np.isfinite(px.at[dt_, s_]) and px.at[dt_, s_] > sec_ma.at[dt_, s_]]]
         return out
 
-    def is_down(sym: str, dt: pd.Timestamp, desc: bool | None = None) -> bool:
-        if sym not in ma_t.columns:
+    def gate_fail(sid: str, dt: pd.Timestamp, desc: bool | None = None) -> str:
+        """strong 模式：返回第一道没过闸的中文原因；空串 = 全过。"""
+        if sid not in ma_t.columns:
+            return "无均线数据"
+        a = px.at[dt, sid]
+        if not np.isfinite(a):
+            return "当日无价格"
+        prev, prev_w = None, None
+        for w in stack_group:
+            m = stack_panels[w].at[dt, sid]
+            if not np.isfinite(m):
+                return f"MA{w} 数据缺失"
+            if prev is not None and not (prev > m):
+                return f"均线未多头排列（MA{prev_w}≤MA{w}）"
+            prev, prev_w = m, w
+        for w, win in slope_wins.items():
+            if win <= 0:
+                continue
+            dlt = slope_panels[w].at[dt, sid]
+            if not np.isfinite(dlt):
+                return f"MA{w} 的 {win} 日斜率数据缺失"
+            if dlt <= 0:
+                return f"MA{w} 的 {win} 日斜率为负"
+        if above_panel is not None:
+            m_long = above_panel.at[dt, sid]
+            if not np.isfinite(m_long):
+                return f"MA{args.trend_above} 数据缺失"
+            if not (a > m_long):
+                return f"收盘跌破 MA{args.trend_above}（{a / m_long - 1:+.1%}）"
+        if cross_panels is not None:
+            fast_m, slow_m = cross_panels[0].at[dt, sid], cross_panels[1].at[dt, sid]
+            if not (np.isfinite(fast_m) and np.isfinite(slow_m)):
+                return "交叉均线数据缺失"
+            if not (fast_m > slow_m):
+                return f"MA{cross_group[0]}<MA{cross_group[1]}"
+        if adx_p is not None:
+            v = adx_p.at[dt, sid]
+            if not np.isfinite(v):
+                return "ADX 数据缺失"
+            if not (v > args.adx_min):
+                return f"ADX {v:.1f}≤{args.adx_min:g}"
+            if args.adx_dir:
+                pdi, mdi = pdi_p.at[dt, sid], mdi_p.at[dt, sid]
+                if not (np.isfinite(pdi) and np.isfinite(mdi)):
+                    return "DI 数据缺失"
+                if not (pdi > mdi):
+                    return "+DI<-DI"
+        if near_high_p is not None:
+            nh = near_high_p.at[dt, sid]
+            if not np.isfinite(nh) or nh <= 0:
+                return "近期高点数据缺失"
+            if (a / nh - 1.0) > -args.max_near_high:
+                return f"贴近日高（距高点 {a / nh - 1:+.1%}）"
+        if pos_p is not None:
+            pv = pos_p.at[dt, sid]
+            if not np.isfinite(pv):
+                return "位置分位缺失"
+            if not (pos_lo <= pv <= pos_hi):
+                return f"位置分位 {pv:.2f} 不在 [{pos_lo:.2f}, {pos_hi:.2f}]"
+        if bb_sd is not None:
+            m_, s_ = bb_ma.at[dt, sid], bb_sd.at[dt, sid]
+            if not (np.isfinite(m_) and np.isfinite(s_)) or s_ <= 0:
+                return "布林带数据缺失"
+            z = (a - m_) / s_
+            if z > bb_zmax:
+                return f"布林 z={z:.2f}>{bb_zmax:g}"
+        return ""
+
+    def is_down(sid: str, dt: pd.Timestamp, desc: bool | None = None) -> bool:
+        if args.trend_mode == "strong":
+            return gate_fail(sid, dt, desc) == ""
+        if sid not in ma_t.columns:
             return False
-        a = px.at[dt, sym]
+        a = px.at[dt, sid]
         if not np.isfinite(a):
             return False
-        if args.trend_mode == "strong":
-            # 强化趋势：排列、斜率、长期均线、趋势强度四道，任何一道不过就不买。
-            # 1) 均线多头排列：trend-stack 给定顺序严格递减（MA5 > MA20 > MA60）
-            prev = None
-            for w in stack_group:
-                m = stack_panels[w].at[dt, sym]
-                if not np.isfinite(m):
-                    return False
-                if prev is not None and not (prev > m):
-                    return False
-                prev = m
-            # 2) --slope-mas 列出的均线斜率为正（当前值高于 stack-slope 个交易日前）。
-            # 默认只查 MA20/MA60：MA5 斜率噪声太大，一票否决过多。
-            for w in slope_group:
-                dlt = slope_panels[w].at[dt, sym] if args.stack_slope > 0 else 1.0
-                if not np.isfinite(dlt) or dlt <= 0:
-                    return False
-            # 3) 收盘价站上长期均线
-            if above_panel is not None:
-                m_long = above_panel.at[dt, sym]
-                if not np.isfinite(m_long) or not (a > m_long):
-                    return False
-            # 4) 中期均线在长期均线之上（MA50 > MA200）
-            if cross_panels is not None:
-                fast_m, slow_m = cross_panels[0].at[dt, sym], cross_panels[1].at[dt, sym]
-                if not (np.isfinite(fast_m) and np.isfinite(slow_m)) or not (fast_m > slow_m):
-                    return False
-            # 5) 趋势强度：ADX 高于阈值（横盘/无趋势时不进场）
-            if adx_p is not None:
-                v = adx_p.at[dt, sym]
-                if not np.isfinite(v) or not (v > args.adx_min):
-                    return False
-            return True
         if args.trend_mode == "ma_stack":
-            # asc：MA10 < MA20 < MA50 空头排列；desc：MA10 > MA20 > MA50 多头排列
             use_desc = (args.stack_order == "desc") if desc is None else bool(desc)
             prev = None
             for w in stack_group:
-                m = stack_panels[w].at[dt, sym]
+                m = stack_panels[w].at[dt, sid]
                 if not np.isfinite(m):
                     return False
                 if prev is not None:
@@ -938,66 +828,89 @@ def main() -> int:
                 prev = m
             return True
         if args.trend_mode == "below_mas":
-            # 收盘价必须低于每一条均线（5/10/20/30 全在上方）
             for w in ma_group:
-                m = ma_panels[w].at[dt, sym]
+                m = ma_panels[w].at[dt, sid]
                 if not np.isfinite(m) or a >= m:
                     return False
             return True
-        m, mp = ma_t.at[dt, sym], ma_t_prev.at[dt, sym]
+        m, mp = ma_t.at[dt, sid], ma_t_prev.at[dt, sid]
         if not (np.isfinite(m) and np.isfinite(mp)):
             return False
         return bool(a < m and m < mp)
 
+    def turnma_pick_on(dt_sel: pd.Timestamp,
+                       exclude: set[str] | None = None) -> tuple[str, str]:
+        """上旬止损后再选股：口径与主循环一致，返回 (security_id, 板块)。
+
+        `exclude` 里的票（刚止损的那只）不参与，下一名顺补。
+        """
+        if dt_sel not in etf_rsrs.index:
+            return "", ""
+        zs = etf_rsrs.loc[dt_sel].dropna().sort_values(ascending=False)
+        if zs.empty:
+            return "", ""
+        ex = {str(s) for s in (exclude or ())}
+        rp2 = turn_score if turn_score is not None else turn_rate
+        use_desc2 = (args.stack_order == "desc") if args.regime_ma == 0 else is_bull(dt_sel)
+        for sec_k in zs.index[: args.turnma_sectors]:
+            pool_k = [s for s in stocks if sec_of.get(s) == sec_k
+                      and s in rp2.columns and in_pool(s, dt_sel)]
+            if not pool_k:
+                continue
+            tt = (rp2.loc[dt_sel, pool_k].dropna().sort_values(ascending=False)
+                  .head(max(1, args.turnma_top)))
+            for s in tt.index:
+                if str(s) in ex:
+                    continue
+                if is_down(str(s), dt_sel, use_desc2):
+                    return str(s), str(sec_k)
+        return "", ""
+
+    # ------------------------------------------------------------------
+    # 调仓日与主循环
+    # ------------------------------------------------------------------
     me = anchors(cal, args.freq)
     if args.anchor_lag:
-        # 调仓日整体前移：RSRS 评分日、CV 窗口截止日、买入价与持有区间一起移动
         pos = np.clip(cal.get_indexer(me) - args.anchor_lag, 0, None)
         me = pd.DatetimeIndex(cal[np.unique(pos)])
-        print(f"调仓日前移 {args.anchor_lag} 个交易日（月末倒数第 {args.anchor_lag + 1} 个交易日）")
+        print(f"调仓日前移 {args.anchor_lag} 个交易日")
+
     scored = etf_rsrs.dropna(how="any").index
     cand = [i for i, d in enumerate(me) if d <= start and d in scored]
     if not cand:
-        raise SystemExit("预热不足")
+        raise SystemExit("预热不足：信号日之前没有可用的板块 RSRS")
     k0 = cand[-1]
 
-    nav_etf = pd.Series(np.nan, index=cal[cal >= start], dtype=float)   # 对照：直接买 ETF
-    nav = nav_etf.copy()
+    nav = pd.Series(np.nan, index=cal[cal >= start], dtype=float)
+    nav_etf = nav.copy()
     cur_s, cur_e, prev = 1.0, 1.0, None
+    prev_s, prev_e = None, None
     rows = []
     for k in range(k0, len(me) - 1):
         sig = me[k]
         if sig not in scored:
             continue
+        probe, cand_gate = [], []
         sec_all = etf_rsrs.loc[sig].dropna().sort_values(ascending=False)
         if sec_all.empty:
             continue
         bull = is_bull(sig)
         bear = args.regime_ma > 0 and not bull
-        nxt = me[k + 1]          # 下一个调仓日：既是持有区间的右端点，也是牛市补选的截止日
+        nxt = me[k + 1]
 
-        # 熊市板块排序：默认沿用 RSRS；--bear-rank slope 时改用加权斜率（值 = %/交易日）；
-        # both = 取「RSRS 前 N ∩ 斜率前 N」的交集，排序仍按 RSRS。
-        # 牛市始终用 RSRS，不受这个开关影响。
         sec_score = sec_all
-        sec_ref = sec_all         # 板块 RSRS 展示/参照系：默认信号日，回看命中时换成命中日
+        sec_ref = sec_all
         slope_now = (etf_slope.loc[sig].reindex(sec_all.index).dropna()
                      if etf_slope is not None else None)
         if bear and slope_now is not None and args.bear_rank == "slope":
             sec_score = slope_now.sort_values(ascending=False)
         elif bear and slope_now is not None and args.bear_rank == "both":
-            # 注意：不能用 k，那是外层调仓循环的下标（会被覆盖掉，导致 nxt 取错、
-            # 熊市期 seg 为空被跳过——2022 年整段熊市消失就是这么来的）
             top_n = max(1, args.bear_intersect_top)
             rsrs_top = set(sec_all.index[:top_n])
             slope_top = set(slope_now.sort_values(ascending=False).index[:top_n])
-            # 交集内按 RSRS 排：斜率负责「真的在涨」，RSRS 负责「不是一次性脉冲」
             sec_score = sec_all[[s_ for s_ in sec_all.index
                                  if s_ in rsrs_top and s_ in slope_top]]
             if sec_score.empty and args.bear_lookback > 0:
-                # 月末那一天恰好交集为空时的补救：回看过去 N 个交易日，取最近一次「双榜都
-                # 满足」的那天及其排名（只用滞后信息，不含未来），仍然为空才算真的没信号。
-                # 与 --bear-refill 的区别：不提前买入，仍然在信号日收盘买、持有整月。
                 i0 = int(cal.get_indexer([sig])[0])
                 for back in range(1, min(args.bear_lookback, i0) + 1):
                     dt_b = cal[i0 - back]
@@ -1008,27 +921,22 @@ def main() -> int:
                     print(f"  熊市回看：{sig.date()} 双榜为空 → 用 {dt_b.date()} 的 "
                           f"{sc_b.index[0]}（回看 {back} 个交易日）", flush=True)
                     break
-
-        # 熊市板块闸门：只让站上 MA(--bear-sector-ma) 的板块进排序。
-        # 全部跌破时就当期不持仓——熊市里没有抱团板块，硬买只是接落刀。
         if bear and sec_ma is not None:
             keep = [s_ for s_ in sec_score.index
                     if s_ in sec_ma.columns and np.isfinite(sec_ma.at[sig, s_])
                     and np.isfinite(px.at[sig, s_]) and px.at[sig, s_] > sec_ma.at[sig, s_]]
             sec_score = sec_score[keep]
+
         no_sector = sec_score.empty
         sector = str(sec_all.index[0]) if no_sector else str(sec_score.index[0])
-
-        pool = [s for s in stocks if sec_of.get(s) == sector and s in stock_rsrs.columns
-                and in_pool(s, sig)]
-        ss = stock_rsrs.loc[sig, pool].dropna().sort_values(ascending=False) if pool else pd.Series(dtype=float)
+        pool_k = [s for s in stocks if sec_of.get(s) == sector
+                  and s in stock_rsrs.columns and in_pool(s, sig)]
+        ss = (stock_rsrs.loc[sig, pool_k].dropna().sort_values(ascending=False)
+              if pool_k else pd.Series(dtype=float))
         pick, buy_etf = "", False
         tried, sec_rank = 0, 0
-        buy_dt, rsrs_ref = sig, sec_ref   # 实际买入日（补选会往后推）与 RSRS 参照系
+        buy_dt, rsrs_ref = sig, sec_ref
 
-        # 熊市双榜补选：当期「RSRS 前 N ∩ 斜率前 N」为空（或动量不达标）时，从下一个交易日起
-        # 逐日重算两榜，第一天同时满足就按当日收盘买入该板块 ETF；到下一个调仓日仍没出现则空仓。
-        # 语义与牛市 --bull-refill 一致：不追已经走完的行情，只在信号真正出现的那天进场。
         if (bear and args.bear_refill and args.bear_rank == "both" and not bear_turn5
                 and not pick_bear_etf(sec_score)):
             n_try = 0
@@ -1048,15 +956,11 @@ def main() -> int:
                       flush=True)
 
         if pick:
-            pass          # 熊市补选已买入，不再走后面的选股链路
+            pass
         elif bear and bear_turn5:
-            # 熊市不分板块：在全市场（本地行情池，已过 --min-mcap）里按当日市值 > 门槛筛一遍，
-            # 再按 20 日均换手率降序取前 N 只，买其中第一只满足「多头」趋势的；一只都没有就
-            # 交给后面的熊市兜底（--bear-etf / --bear-spy）。判定口径与牛市 turnma 一致，
-            # 只是候选池从「最强板块的成分股」换成「全市场」。
             cand_t = [s for s in stocks
                       if s in turn_rate.columns and s in px.columns and in_pool(s, sig)
-                      and mcap_above(mcap_panel, s, sig, args.bear_turn_mcap * 1e8)]
+                      and mcap_above(mcap, s, sig, args.bear_turn_mcap * 1e8)]
             tt = (turn_rate.loc[sig, cand_t].dropna().sort_values(ascending=False)
                   .head(max(1, args.bear_turn_top)) if cand_t else pd.Series(dtype=float))
             for s in tt.index:
@@ -1064,39 +968,33 @@ def main() -> int:
                 if is_down(str(s), sig, True):
                     pick = str(s)
                     sector = sec_of.get(pick, BENCH)
-                    if sector not in SECTOR_ETFS:
+                    if sector not in active_etfs:
                         sector = BENCH
                     sec_rank = 1
                     break
             print(f"  熊市 turn5 {sig.date()}：TOP{len(tt)} "
-                  f"{' '.join(f'{s}({v:.2%})' for s, v in tt.items())} "
-                  f"→ {pick or '空仓（交给熊市兜底）'}", flush=True)
+                  f"{' '.join(f'{T(s)}({v:.2%})' for s, v in tt.items())} "
+                  f"→ {T(pick) if pick else '空仓（交给熊市兜底）'}", flush=True)
         elif no_sector:
-            pass          # 熊市里 11 个板块全在均线下方：当期空仓
+            pass
         elif bear and args.bear_etf_only:
-            # 熊市完全不碰个股：直接持有最强板块的 ETF（动量不达标则空仓）
             etf_sym = pick_bear_etf(sec_score)
             if etf_sym:
                 sector = etf_sym
                 pick, buy_etf, sec_rank = f"ETF:{etf_sym}", True, 1
         elif args.pick in ("mcap", "mmin"):
-            ranked = sorted([s for s in pool if np.isfinite(mcap_of.get(s, np.nan))],
+            mcap_of = mcap.ffill().iloc[-1]
+            ranked = sorted([s for s in pool_k if np.isfinite(mcap_of.get(s, np.nan))],
                             key=lambda s: float(mcap_of[s]), reverse=(args.pick == "mcap"))
             pick = ranked[0] if ranked else ""
         elif args.pick == "turn":
             rp = turn_score if turn_score is not None else turn_rate
-            cand = [s for s in pool if s in rp.columns]
-            t = rp.loc[sig, cand].dropna().sort_values(ascending=False) \
-                if cand else pd.Series(dtype=float)
+            cand_t = [s for s in pool_k if s in rp.columns]
+            t = (rp.loc[sig, cand_t].dropna().sort_values(ascending=False)
+                 if cand_t else pd.Series(dtype=float))
             ri = min(max(1, args.turn_rank), len(t)) - 1
             pick = str(t.index[ri]) if len(t) else ""
         elif args.pick == "turnma":
-            # 换手率降序 + 均线排列：按板块 RSRS 顺序下探，板块内按换手率取前 N 只，
-            # 买第一只满足排列方向的（默认 desc = 多头排列，即上升趋势）。
-            # 排序口径见 --turn-rank-mode：abs = turn20（旧口径）；
-            # ratio = turn20²/turn120（绝对换手率 × 相对自身半年常态的放大倍数）。
-            # --bull-refill：牛市当期一只都没过时，从下一个交易日起逐日重挑（板块 RSRS、
-            # 换手率、趋势闸全部换成当日数据），买到为止；到下一个调仓日仍找不到才空仓。
             use_desc = (args.stack_order == "desc") if args.regime_ma == 0 else bull
             rp = turn_score if turn_score is not None else turn_rate
             pick, tried, sec_rank = "", 0, 0
@@ -1112,40 +1010,67 @@ def main() -> int:
                     sec_pool = zs
                 else:
                     sec_pool = sec_score
+                probe, cand_gate = [], []
                 for rank_s, sec_k in enumerate(sec_pool.index[: args.turnma_sectors], 1):
-                    pool_k = [s for s in stocks if sec_of.get(s) == sec_k
-                              and s in rp.columns and in_pool(s, dt_try)]
-                    if not pool_k:
+                    pool_k2 = [s for s in stocks if sec_of.get(s) == sec_k
+                               and s in rp.columns and in_pool(s, dt_try)]
+                    if not pool_k2:
+                        probe.append(f"{sec_k}#{rank_s}:")
                         continue
-                    tt = (rp.loc[dt_try, pool_k].dropna()
-                          .sort_values(ascending=False).head(args.turnma_top))
+                    tt_all = (rp.loc[dt_try, pool_k2].dropna()
+                              .sort_values(ascending=False))
+                    probe.append(f"{sec_k}#{rank_s}:" + ",".join(
+                        T(str(x)) for x in tt_all.head(max(1, args.turnma_top)).index))
+                    if pick:
+                        for s_ in tt_all.head(max(1, args.turnma_top)).index:
+                            gf_ = (gate_fail(str(s_), dt_try, use_desc)
+                                   if args.trend_mode == "strong" else "")
+                            cand_gate.append(f"{T(str(s_))}={'PASS' if not gf_ else gf_}")
+                        continue
+                    if args.debug_pool:
+                        _elig = [str(x) for x in tt_all.index
+                                 if is_down(str(x), dt_try, use_desc)]
+                        _rank = (list(tt_all.index).index(_elig[0]) + 1) if _elig else 0
+                        print(f"[dbg] {dt_try.date()} {'sig' if dt_try == sig else 'try'}"
+                              f"#r{rank_s} {sec_k} 候选{len(pool_k2)} "
+                              f"合格{len(_elig)} 首位排名{_rank} "
+                              f"{','.join(_elig[:6])}", flush=True)
+                    if args.turn_trend_first:
+                        for s in tt_all.index:
+                            tried += 1
+                            if is_down(str(s), dt_try, use_desc):
+                                pick, sector, sec_rank = str(s), str(sec_k), rank_s
+                                buy_dt = dt_try
+                                rsrs_ref = zs if dt_try != sig else sec_all
+                                break
+                        continue
+                    tt = tt_all.head(args.turnma_top)
                     for s in tt.index:
+                        s_ = str(s)
+                        gf = (gate_fail(s_, dt_try, use_desc)
+                              if args.trend_mode == "strong" else "")
+                        if pick:
+                            cand_gate.append(f"{T(s_)}={'PASS' if not gf else gf}")
+                            continue
                         tried += 1
-                        if is_down(str(s), dt_try, use_desc):
-                            pick, sector, sec_rank = str(s), str(sec_k), rank_s
+                        cand_gate.append(f"{T(s_)}={gf or 'OK'}")
+                        if is_down(s_, dt_try, use_desc):
+                            pick, sector, sec_rank = s_, str(sec_k), rank_s
                             buy_dt = dt_try
                             rsrs_ref = zs if dt_try != sig else sec_all
-                            break
-                    if pick:
-                        break
                 if pick:
                     break
         elif args.pick == "dvol":
-            cand = [s for s in pool if s in dvol.columns]
-            t = dvol.loc[sig, cand].dropna().sort_values(ascending=False) \
-                if cand else pd.Series(dtype=float)
+            cand_t = [s for s in pool_k if s in dvol.columns]
+            t = (dvol.loc[sig, cand_t].dropna().sort_values(ascending=False)
+                 if cand_t else pd.Series(dtype=float))
             pick = str(t.index[0]) if len(t) else ""
         elif args.pick in ("dvolcv", "dvolcvh"):
-            cand = [s for s in pool if s in dvol_cv.columns]
-            t = dvol_cv.loc[sig, cand].dropna().sort_values(
-                ascending=(args.pick == "dvolcv")) if cand else pd.Series(dtype=float)
+            cand_t = [s for s in pool_k if s in dvol_cv.columns]
+            t = (dvol_cv.loc[sig, cand_t].dropna().sort_values(
+                ascending=(args.pick == "dvolcv")) if cand_t else pd.Series(dtype=float))
             pick = str(t.index[0]) if len(t) else ""
         elif args.pick == "cvdown":
-            # 按板块 RSRS 顺序逐个下探：板块内取 CV 最高的前 N 只，买第一只满足均线排列的；
-            # 整个板块都不合格就换下一个板块；全部候选都不合格则当期空仓。
-            # 启用 --regime-ma 时：牛市（SPY 在线上）要多头排列；
-            # 熊市按 --regime-bear 处理：nofilter 不做多头筛选（直接取 CV 第一名）、
-            # downtrend 改要空头排列、cash 空仓。
             use_desc = (args.stack_order == "desc") if args.regime_ma == 0 else bull
             skip_all = (bear and args.regime_bear == "cash")
             pick, tried, sec_rank = "", 0, 0
@@ -1159,11 +1084,12 @@ def main() -> int:
                     pick, tried, sec_rank = str(t1.index[0]), 1, 1
             elif not skip_all:
                 for rank_s, sec_k in enumerate(sec_score.index[: args.cvdown_sectors], 1):
-                    pool_k = [s for s in stocks if sec_of.get(s) == sec_k
-                              and s in dvol_cv.columns and in_pool(s, sig)]
-                    if not pool_k:
+                    pool_k2 = [s for s in stocks if sec_of.get(s) == sec_k
+                               and s in dvol_cv.columns and in_pool(s, sig)]
+                    if not pool_k2:
                         continue
-                    tt = dvol_cv.loc[sig, pool_k].dropna().sort_values(ascending=False).head(args.cvdown_top)
+                    tt = (dvol_cv.loc[sig, pool_k2].dropna().sort_values(ascending=False)
+                          .head(args.cvdown_top))
                     for s in tt.index:
                         tried += 1
                         if is_down(str(s), sig, use_desc):
@@ -1174,80 +1100,184 @@ def main() -> int:
         else:
             pick = str(ss.index[0]) if len(ss) else ""
 
-        # 熊市里趋势选股一个都没过：买最强板块的 ETF。逻辑是「资金抱团的那个板块本身」
-        # 在熊市里相对抗跌，空仓等于放弃这块相对收益。牛市不兜底，选不到就空仓。
         if not pick and bear and args.bear_etf and not no_sector:
             etf_sym = pick_bear_etf(sec_score)
             if etf_sym:
                 sector, pick, buy_etf = etf_sym, f"ETF:{etf_sym}", True
                 sec_rank = sec_rank or 1
-
-        # 熊市双条件（或动量门槛）全不达标：与其空仓一个月，不如买 SPY 跟住大盘。
-        # 双条件太严时交集经常为空，空仓在 2025-03/2026-03 这类「指数已经修复」的窗口
-        # 会白丢整月涨幅；代价是真正单边下跌的月份要跟着 SPY 一起吃跌幅。
         if not pick and bear and args.bear_spy:
             sector, pick, buy_etf = BENCH, f"ETF:{BENCH}", True
             sec_rank = sec_rank or 1
+
+        # 本期板块内换手率前 3（看板画同期走势用，展示 ticker）
+        cand3 = []
+        rp_rank = turn_score if turn_score is not None else turn_rate
+        if sector in active_etfs and rp_rank is not None:
+            c_pool = [s for s in stocks if sec_of.get(s) == sector
+                      and s in rp_rank.columns and in_pool(s, buy_dt)]
+            if c_pool:
+                cand3 = [T(str(x)) for x in rp_rank.loc[buy_dt, c_pool].dropna()
+                         .sort_values(ascending=False).head(3).index]
+        if not probe and args.pick == "turnma" and rp_rank is not None and buy_dt in etf_rsrs.index:
+            sec_order = (etf_rsrs.loc[buy_dt].dropna()
+                         .sort_values(ascending=False).index[: args.turnma_sectors])
+            for rank_s, sec_k in enumerate(sec_order, 1):
+                pool_k2 = [s for s in stocks if sec_of.get(s) == sec_k
+                           and s in rp_rank.columns and in_pool(s, buy_dt)]
+                if not pool_k2:
+                    probe.append(f"{sec_k}#{rank_s}:")
+                    continue
+                tt_all = rp_rank.loc[buy_dt, pool_k2].dropna().sort_values(ascending=False)
+                probe.append(f"{sec_k}#{rank_s}:" + ",".join(
+                    T(str(x)) for x in tt_all.head(max(1, args.turnma_top)).index))
 
         seg = cal[(cal > buy_dt) & (cal <= nxt) & (cal >= start)]
         if len(seg) == 0:
             prev = pick
             continue
-
-        # 补选的等待期：旧仓已在信号日卖出，这段是空仓，净值平推以保持曲线连续
         if buy_dt != sig:
             for dt in cal[(cal > sig) & (cal <= buy_dt) & (cal >= start)]:
                 nav.loc[dt] = cur_s
                 nav_etf.loc[dt] = cur_e
             if pick:
                 print(f"  {'牛市' if bull else '熊市'}补选：{sig.date()} 无票 → "
-                      f"{buy_dt.date()} 买入 {pick}（{sector}）", flush=True)
+                      f"{buy_dt.date()} 买入 {T(pick)}（{sector}）", flush=True)
 
         turnover = 0.0 if pick == prev else (2.0 if prev else 1.0)
-        # 买 ETF 时买卖价用板块 ETF 的列，个股时用个股列；补选时用实际买入日收盘
+        pick0 = pick
         base_px = float(px.at[buy_dt, sector if buy_etf else pick]) if pick else np.nan
-        stopped, stop_dt = False, None
-        for j, dt in enumerate(seg):
+        stopped, stop_dt, stop_kind = False, None, ""
+        repick_dt, repick_sym = None, ""
+        n_stop = 0
+        sector0, sector_e = sector, sector
+
+        def _c_at(d: pd.Timestamp, s_: str) -> float:
+            return float(px.at[d, s_]) if (d in px.index and s_ in px.columns) else np.nan
+
+        def stop_setup(sid: str, d_buy: pd.Timestamp) -> tuple[bool, float]:
+            if stop_ma_p is None or not sid or sid not in stop_ma_p.columns:
+                return False, np.nan
+            if d_buy not in px.index or d_buy not in stop_ma_p.index:
+                return False, np.nan
+            c_, m_ = _c_at(d_buy, sid), float(stop_ma_p.at[d_buy, sid])
+            if not (np.isfinite(c_) and np.isfinite(m_)):
+                return False, np.nan
+            if c_ > m_:
+                return True, np.nan
+            fixed = c_ * (1.0 - args.stop_pct)
+            # 下轨取「买入日前一交易日」：买入日的下轨要用当日收盘才能算出，
+            # 拿它当买入时就已确定的止损位属于轻微前视
+            i_b = int(cal.get_indexer([d_buy])[0])
+            d_bb = cal[i_b - 1] if i_b > 0 else d_buy
+            bb = (float(stop_bb_low.at[d_bb, sid])
+                  if stop_bb_low is not None and d_bb in stop_bb_low.index
+                  and sid in stop_bb_low.columns else np.nan)
+            if np.isfinite(bb) and bb > 0:
+                fixed = min(fixed, bb)
+            return False, fixed
+
+        above_ma, stop_px = (stop_setup(pick, buy_dt) if (pick and not buy_etf)
+                             else (False, np.nan))
+
+        j = 0
+        while j < len(seg):
+            dt = seg[j]
+            j_step = 1
             if j == 0:
                 cur_s *= (1.0 - args.cost * turnover)
                 cur_e *= (1.0 - args.cost * turnover)
             if pick and not stopped:
-                # 买 ETF 时策略收益即该板块 ETF 收益（与对照同源，选股差为 0）
                 a = ret_etf.loc[dt, sector] if buy_etf else ret_stk.loc[dt, pick]
                 cur_s *= (1.0 + (0.0 if pd.isna(a) else a))
-                # 收盘价比买入价跌破阈值 → 当日收盘割肉，当期剩余时间空仓
-                if args.stop_loss > 0 and not buy_etf and np.isfinite(base_px) and base_px > 0:
-                    if px.at[dt, pick] / base_px - 1.0 <= -args.stop_loss:
-                        stopped, stop_dt = True, dt.date()
-            b = ret_etf.loc[dt, sector]
+                hit, kind = False, ""
+                if args.stop_ma20 > 0 and not buy_etf:
+                    if above_ma:
+                        i_ = int(cal.get_indexer([dt])[0])
+                        if i_ > 0:
+                            d0 = cal[i_ - 1]
+                            c0, c1 = _c_at(d0, pick), _c_at(dt, pick)
+                            m0 = (float(stop_ma_p.at[d0, pick])
+                                  if d0 in stop_ma_p.index else np.nan)
+                            m1 = (float(stop_ma_p.at[dt, pick])
+                                  if dt in stop_ma_p.index else np.nan)
+                            if (np.isfinite(c0) and np.isfinite(c1)
+                                    and np.isfinite(m0) and np.isfinite(m1)
+                                    and c0 < m0 and c1 < m1):
+                                hit, kind = True, f"MA{args.stop_ma20}"
+                    elif np.isfinite(stop_px) and stop_px > 0:
+                        if _c_at(dt, pick) <= stop_px:
+                            hit, kind = True, f"固定{args.stop_pct:.0%}"
+                if (not hit and args.stop_loss > 0 and not buy_etf
+                        and np.isfinite(base_px) and base_px > 0):
+                    if _c_at(dt, pick) / base_px - 1.0 <= -args.stop_loss:
+                        hit, kind = True, f"{args.stop_loss:.0%}"
+                if hit:
+                    stopped = True
+                    n_stop += 1
+                    if n_stop == 1:
+                        stop_dt, stop_kind = dt.date(), kind
+                    if args.stop_repick_dom > 0:
+                        allow_repick = dt.day < args.stop_repick_dom
+                    else:
+                        allow_repick = (j + 1) <= max(1, args.stop_repick_days)
+                    if (args.stop_ma20 > 0 or args.stop_loss > 0) and n_stop == 1 and allow_repick:
+                        for dt_try in cal[(cal > dt) & (cal <= nxt)]:
+                            p2, s2 = turnma_pick_on(dt_try, exclude={pick0})
+                            if not p2:
+                                continue
+                            repick_dt, repick_sym = dt_try.date(), T(p2)
+                            pick, sector, buy_etf = p2, s2, False
+                            base_px = _c_at(dt_try, p2)
+                            above_ma, stop_px = stop_setup(p2, dt_try)
+                            cur_s *= (1.0 - args.cost * 1.0)
+                            stopped = False
+                            j_step = (int(seg.get_loc(dt_try)) + 1 - j
+                                      if dt_try in seg else len(seg) - j)
+                            print(f"  上旬止损再选股：{dt.date()} 止损 {kind} → "
+                                  f"{dt_try.date()} 买入 {T(p2)}（{s2}）", flush=True)
+                            break
+            b = ret_etf.loc[dt, sector_e]
             cur_e *= (1.0 + (0.0 if pd.isna(b) else b))
             nav.loc[dt] = cur_s
             nav_etf.loc[dt] = cur_e
+            j += j_step
 
-        seg_s = nav.loc[seg].iloc[-1] / nav.loc[seg].iloc[0] - 1
-        seg_e = nav_etf.loc[seg].iloc[-1] / nav_etf.loc[seg].iloc[0] - 1
+        base_s = nav.loc[seg].iloc[0] if prev_s is None else prev_s
+        base_e = nav_etf.loc[seg].iloc[0] if prev_e is None else prev_e
+        seg_s = cur_s / base_s - 1.0
+        seg_e = cur_e / base_e - 1.0
+        prev_s, prev_e = cur_s, cur_e
         sp = bench.reindex(seg).ffill()
         rows.append({
             "信号日": sig.date(), "持有期起": seg[0].date(), "持有期止": seg[-1].date(),
-            "板块": sector,
-            "板块RSRS": (round(float(rsrs_ref[sector]), 2) if sector in rsrs_ref.index
-                        else (np.nan if sector == BENCH else round(float(rsrs_ref.iloc[0]), 2))),
-            "板块斜率%": (round(float(etf_slope.at[buy_dt, sector]) * 100, 3)
-                       if etf_slope is not None and sector in etf_slope.columns
-                       and np.isfinite(etf_slope.at[buy_dt, sector]) else np.nan),
-            "斜率序": (int(etf_slope.loc[buy_dt].rank(ascending=False)[sector])
-                    if etf_slope is not None and sector in etf_slope.columns
-                    and np.isfinite(etf_slope.at[buy_dt, sector]) else np.nan),
+            "板块": sector0,
+            "板块RSRS": (round(float(rsrs_ref[sector0]), 2) if sector0 in rsrs_ref.index
+                        else (np.nan if sector0 == BENCH else round(float(rsrs_ref.iloc[0]), 2))),
+            "板块斜率%": (round(float(etf_slope.at[buy_dt, sector0]) * 100, 3)
+                       if etf_slope is not None and sector0 in etf_slope.columns
+                       and np.isfinite(etf_slope.at[buy_dt, sector0]) else np.nan),
+            "斜率序": (int(etf_slope.loc[buy_dt].rank(ascending=False)[sector0])
+                    if etf_slope is not None and sector0 in etf_slope.columns
+                    and np.isfinite(etf_slope.at[buy_dt, sector0]) else np.nan),
             "补选日": (buy_dt.date() if buy_dt != sig else None),
             "板块RSRS序": sec_rank or 1,
             "牛市": int(bull),
-            "个股": pick,
+            "个股": T(pick0) if pick0 else "",
+            "个股ID": (pick0 if pick0 and not buy_etf else ""),
             "候选尝试": tried,
-            "个股RSRS": (round(float(stock_rsrs.at[buy_dt, pick]), 2)
-                       if pick and pick in stock_rsrs.columns else np.nan),
+            "个股RSRS": (round(float(stock_rsrs.at[buy_dt, pick0]), 2)
+                       if pick0 and not buy_etf and pick0 in stock_rsrs.columns else np.nan),
             "同板块候选": len(ss),
+            "位置分位": (round(float(pos_p.at[buy_dt, pick0]), 3)
+                     if pos_p is not None and pick0 and pick0 in pos_p.columns
+                     and np.isfinite(pos_p.at[buy_dt, pick0]) else np.nan),
             "个股收益": round(float(seg_s), 4), "ETF收益": round(float(seg_e), 4),
             "选股差": round(float(seg_s - seg_e), 4), "止损日": stop_dt,
+            "止损类型": (stop_kind or None),
+            "再选股": (f"{repick_dt} {repick_sym}" if repick_dt else None),
+            "候选前3": ",".join(cand3),
+            "候选明细": "|".join(probe),
+            "候选闸门": ("|".join(cand_gate) if cand_gate else None),
             "SPY": round(float(sp.iloc[-1] / sp.iloc[0] - 1), 4) if len(sp) > 1 else np.nan,
         })
         prev = pick
@@ -1274,15 +1304,27 @@ def main() -> int:
         print(f"熊市 {len(bear_hdf)} 期：买 ETF {n_etf} 期 / 空仓 {n_cash} 期 / "
               f"个股 {len(bear_hdf) - n_etf - n_cash} 期")
 
+    # 目录名：源固定 _pool，其余参数照旧
     tag = f"_{args.tag}" if args.tag else ""
     ftag = "" if args.freq == "M" else f"_{args.freq}"
     ptag = "" if args.pick == "rsrs" else f"_{args.pick}"
-    if use_crsp:
-        ptag += "_crsp" + ("" if args.crsp_scope == "all" else f"_{args.crsp_scope}")
+    ptag += "_pool"
+    if drop_sec:
+        ptag += "_no-" + "-".join(sorted(drop_sec))
     if args.pick == "turn" and args.turn_rank > 1:
         ptag += f"_r{args.turn_rank}"
     if args.stop_loss > 0:
         ptag += f"_sl{round(args.stop_loss * 100)}"
+        if int(args.stop_repick_dom) > 0:
+            ptag += f"_srdom{args.stop_repick_dom}"
+    if args.stop_ma20 > 0:
+        ptag += f"_stma{args.stop_ma20}"
+        if abs(float(args.stop_pct) - 0.07) > 1e-9:
+            ptag += f"_stp{round(args.stop_pct * 100)}"
+        if int(args.stop_repick_days) != 10:
+            ptag += f"_rp{args.stop_repick_days}"
+        if int(args.stop_repick_dom) > 0:
+            ptag += f"_srdom{args.stop_repick_dom}"
     if args.cv_lag:
         ptag += f"_lag{args.cv_lag}"
     if args.pick in ("cvdown", "turnma") and args.trend_mode != "ma_down":
@@ -1290,13 +1332,10 @@ def main() -> int:
         if args.trend_mode == "ma_stack":
             ptag += f"_{args.stack_order}"
         elif args.trend_mode == "strong":
-            # 目录名带上全部过滤条件，避免不同口径互相覆盖
             ptag += "_" + "-".join(x for x in str(args.trend_stack).split(",") if x.strip())
-            if args.stack_slope > 0:
-                ptag += f"_sl{args.stack_slope}"
-            slope_tag = [x for x in str(args.slope_mas).split(",") if x.strip()]
-            if args.stack_slope > 0 and slope_tag != ["5", "20", "60"]:
-                ptag += "_slma" + "-".join(slope_tag)
+            wins_tag = "-".join(f"{w}x{win}" for w, win in slope_wins.items() if win > 0)
+            if wins_tag and wins_tag != "20x10-60x5":
+                ptag += f"_slma{wins_tag}"
             if args.trend_above > 0:
                 ptag += f"_a{args.trend_above}"
             cross_tag = [x for x in str(args.trend_cross).split(",") if x.strip()]
@@ -1304,8 +1343,16 @@ def main() -> int:
                 ptag += "_x" + "-".join(cross_tag)
             if args.adx_min > 0:
                 ptag += f"_adx{args.adx_min:g}"
-    if args.pick in ("turn", "turnma"):
-        ptag += {"ws": "_turnws", "snapshot": "_shsnap"}[args.turn_shares]
+            if args.adx_dir:
+                ptag += "_adxdi"
+            if args.max_near_high > 0:
+                ptag += f"_nh{args.near_high_len}x{round(args.max_near_high * 1000)}"
+            if pos_lo is not None:
+                ptag += f"_pos{pos_len}x{round(pos_lo * 100)}-{round(pos_hi * 100)}"
+            if bb_sd is not None:
+                ptag += f"_bbz{args.bb_window}x{round(bb_zmax * 10)}"
+    if args.pick in ("turn", "turnma") and args.turn_trend_first:
+        ptag += "_tfirst"
     if args.turn_rank_mode == "ratio":
         ptag += "_tratio"
     if args.bull_refill:
@@ -1316,15 +1363,8 @@ def main() -> int:
         ptag += f"_tail{round(args.turn_tail * 100)}"
     if args.exclude:
         ptag += "_ex" + args.exclude.upper().replace(",", "")
-    if args.pool_cutoff:
-        ptag += "_pc" + pd.Timestamp(args.pool_cutoff).strftime("%y%m%d")
-    if args.pool_mode == "mcap":
-        ptag += f"_pmcap{args.pool_top}" + ("" if args.pool_shares == "current"
-                                            else f"_{args.pool_shares}")
-    if args.pool_mode == "pit":
-        ptag += "_ppit"
     if args.min_mcap > 0:
-        ptag += f"_mc{int(args.min_mcap)}" + ("_mcstat" if args.mcap_shares == "static" else "")
+        ptag += f"_mc{int(args.min_mcap)}"
     if args.anchor_lag:
         ptag += f"_al{args.anchor_lag}"
     if args.regime_ma > 0:
@@ -1356,6 +1396,7 @@ def main() -> int:
         ptag += "_bbref"
     if args.bear_lookback > 0:
         ptag += f"_blb{args.bear_lookback}"
+
     out = ROOT / "reports" / "etf" / f"rsrs_stock_n{sn}_m{sm}_top1{ptag}{ftag}{tag}"
     out.mkdir(parents=True, exist_ok=True)
     nav.rename("nav").to_csv(out / "nav_daily.csv", encoding="utf-8-sig")
