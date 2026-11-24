@@ -1,32 +1,52 @@
 # 模拟盘（GitHub Actions + pushplus）
 
 定稿策略：板块 → 个股双层 RSRS。牛市里板块内按 `turn20²/turn120` 取前 3，要求 strong 趋势五闸
-（MA20>MA60、两条均线 5 日斜率为正、收盘>MA50、MA50>MA200、ADX(14)>20），最多下探 3 个板块；
+（MA20>MA60、MA20 的 10 日与 MA60 的 5 日斜率为正、收盘>MA50、MA50>MA200、ADX(14)>10），
+最多下探 3 个板块；
 熊市完全不碰个股，只买「板块 RSRS 前 3 ∩ 120 日加权斜率前 3」里最强的那只 ETF，RSRS ≤0 就空仓。
-月末最后一个交易日**收盘前 30 分钟**决策，单票满仓、不设止损；调仓日空仓时，牛市在其后每个
-交易日补选一次，直到下一个调仓日。
+月末最后一个交易日**收盘前 30 分钟**决策，单票满仓；**收盘价相对买入价跌 10% 当日收盘割肉**，
+割肉日在该自然月 11 号之前则次日起逐日重选（排除刚割的那只），否则空仓到下一个调仓日。
+调仓日空仓时，牛市在其后每个交易日补选一次，直到下一个调仓日。
 
 定稿参数（与回测产出一一对应，`signal.py` 的常量必须和这份命令逐项对齐）：
 
 ```
 --n 20 --m 40 --pick turnma --turnma-top 3 --turnma-sectors 3
---trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60
---trend-above 50 --trend-cross 50,200 --adx-min 20
---turn-shares ws --turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
---min-mcap 500
+--trend-mode strong --trend-stack 20,60 --slope-mas 20:10,60:5
+--trend-above 50 --trend-cross 50,200 --adx-min 10
+--turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
+--min-mcap 500 --exclude-sectors XLRE
 --regime-ma 200 --regime-window 21 --bear-etf-only --bear-rank both
 --bear-intersect-top 3 --bear-slope-window 120 --bear-min-score 0
+--stop-loss 0.10 --stop-repick-dom 11
+--start 2021-11-13 --end 2026-11-13
 ```
 
-回测产物目录
-`reports/etf/rsrs_stock_n20_m40_top1_turnma_strong_20-60_sl5_slma20-60_a50_x50-200_adx20_turnws_tratio_bref_cap20_tail48_ppit_mc500_reg200_bearnofilter_rw21_betfonly_bmin0_brankBoth3x120_merged/`
-（2021-11 ~ 2026-10：`--pool-mode pit` 累计 **+4995.8%**、年化 122.3%、夏普 2.770、回撤 −36.93%；
-snapshot 池口径 +2604.7%。差 13% 左右是数据版本差，见 `docs/PROGRESS.md` 2026-11-20 条）。
+回测产物目录（池层口径，板块层剔除 XLRE，固定 10% 止损）
+`reports/etf/rsrs_stock_n20_m40_top1_turnma_pool_no-XLRE_sl10_srdom11_strong_..._sl10dom11/`
+（2021-11 ~ 2026-11，61 期：累计 **+2835.5%**、年化 97.4%、波动 37.7%、夏普 2.587、
+最大回撤 −34.3%；同期 SPY +72.6%）。只算 CRSP 段（到 2025-12-31、50 期）是
+**+726.0% / 年化 67.3% / 波动 30.1% / 夏普 2.238 / 最大回撤 −22.1%**。
+对照的「不设止损」口径是 61 期 +2472.2% / 92.1% / 2.396 / −36.7%，50 期
++832.3% / 72.2% / 2.300 / −22.1%——止损在 CRSP 段是负贡献（收益 −106pp、夏普 −0.06、回撤持平），
+61 期的优势全部来自 2026-03 那一次割肉（F −18.2% → +5.4%，换 OXY），61 期总共只触发 4 次。
+2026 那 10 期来自本地行情延展（`src='local_ext'`，非 CRSP），累计 +274.3%，其中 3 期
+（SNDK +72.4%/+54.6%、MRNA +37.1%）贡献了绝大部分，**不能单独当年化能力引用**。
+旧的本地快照口径（同区间 +637.9%，把 2026 段也算进去时曾报 +2989.5%）与 ticker 口径
+CRSP 视图（+207.1%）都已作废，代码也已删除。
+
+**回测数据源只有一套**：`data/curated/sp500_pool`（security_id = CRSP PERMNO 主键），
+价格 / 换手率（成交量÷总股本）/ 市值（DlyCap）/ 成分区间（PIT）四类全部来自池层。
+`--data-source` 开关已删除（`src/quant/data/source.py` 一并删除），没有第二套可选口径。
+CRSP 数据包的硬边界是 2025-12-31，边界之后由 `scripts/extend_pool_to_latest.py`
+用本地行情按重叠区间缩放进同一价格空间、写成 `*_ext.parquet`（`src='local_ext'`），
+仍由同一个 `pool` 接口读取，所以回测能跑到 2026-11-13。
+实盘仍用 SSGA 当前快照 + 腾讯/新浪实时报价，与回测的 PIT 名单不同，见「六、口径差异」。
 
 **市值门槛 500 亿美元是数据清洗口径，不是调参**：小盘票的换手率分母（股本）小、噪声大，
 且天然高换手，不设门槛会让「按换手率排序」系统性偏向指数尾部（NCLH 市值 65~100 亿美元、
 日换手 5%，曾长期排在 XLY 第一）。阈值不能按收益挑——100/200/300/500 四档的回测收益
-并不单调（500 亿最高、300 亿最差），详见 `docs/PROGRESS.md`。
+并不单调（500 亿最高、300 亿最差），详见 `docs/BACKTEST_HANDOFF.md` 的扫参一节。
 
 ---
 
@@ -35,7 +55,7 @@ snapshot 池口径 +2604.7%。差 13% 左右是数据版本差，见 `docs/PROGR
 | 时间（ET） | 谁 | 动作 |
 |---|---|---|
 | 收盘后 +8 分钟 | `scripts.paper_close_update` | 补当天行情（yahoo）→ 把当天换手率写进面板 → 提交 data 分支 |
-| 收盘前 30 分钟 | `scripts.live_signal` | 判断今天该干什么（调仓/周报/补选/都不做）→ 拉实时报价 → 算当期信号 → pushplus 推送 → 写账本 |
+| 收盘前 30 分钟 | `scripts.live_signal` | 判断今天该干什么（调仓/周报/**止损**/补选/都不做）→ 拉实时报价 → 算当期信号 → pushplus 推送 → 写账本 |
 | 其它时间 | 同上 | 取当日收盘时间后不在窗口内，`exit 0`，什么都不做 |
 
 **每个交易日都会在收盘前 30 分钟算一次**（`scripts/cron_sync.py` 的 `day_triggers` 改成所有
@@ -65,6 +85,15 @@ snapshot 池口径 +2604.7%。差 13% 左右是数据版本差，见 `docs/PROGR
   链路选股——回测就是在信号日判定的牛市里逐日重挑的，中途切换分支会凭空多出一笔 ETF 交易。
 - **不补选的两种情形**：熊市空仓不补（回测的 `--bear-refill` 没在定稿命令里）；调仓日
   有票就更不补。
+- **止损（回测 + 实盘都已生效）**：`--stop-loss 0.10 --stop-repick-dom 11` —— 收盘价相对买入价跌
+  10% 当日割肉；割肉日在该自然月 **11 号之前** → 次日起逐日重选（口径与调仓日一致，但**排除刚割的
+  那只**），否则空仓到下一个调仓日。61 期只触发 4 次、重选 2 次。
+  - 实盘由 `scripts/live_signal.py` 的 `--kind stop` 承担：**有持仓的每个交易日**收盘前 30 分钟跑一次，
+    只拉持仓票一个报价（不跑全池 RSRS），跌幅按复权口径算（拆股不会被误判）；
+  - 触发后推一条「止损卖出」，账本记 `kind=stop` 并滚动净值；11 号之前则开启「止损重选」
+    （`refill.json` 带 `origin=stop` + `exclude=刚割的票`），次日逐日重挑、排除原票；
+  - ⚠ 唯一的近似：回测用**收盘价**判定、收盘价成交；实盘用收盘前 30 分钟的现价，最后半小时的
+    波动可能让它早割或晚割一天。ET 收盘前 30 分钟这个时点与买卖决策是同一个，不是新增误差。
 
 ## 二、为什么时间不写死
 
@@ -76,6 +105,11 @@ snapshot 池口径 +2604.7%。差 13% 左右是数据版本差，见 `docs/PROGR
 `quant.live.calendar` 现算：取当日收盘时间 → 减 30 分钟 → 只接受「早不超过 5 分钟、
 晚不超过 40 分钟」。早到会让换手率被系统性低估，所以早的余量给得很小；迟到只是晚几分钟
 知道买什么，给它 40 分钟吃掉排队延迟。
+
+**每个交易日的判定顺序**（止损上线后，四者互斥）：月末最后交易日 → `kind=rebalance`；
+本周最后交易日 → `kind=week`；有持仓 → `kind=stop`（只查 10% 止损）；空仓且补选窗口开着 →
+`kind=refill`（牛市补选 / 止损重选）；都不满足 → `noop`。所以准点触发器现在是**每个交易日**
+都会 dispatch，不再只挑调仓日/周末。
 
 **实测事实（2026-11-17）**：schedule 不是"漂 5~30 分钟"，而是整段延迟数小时或丢失——当天
 5 次定时运行全落在 UTC 00:24~04:03，cron 设的却是 16:30~21:30Z，窗口内一次都没有。
@@ -140,11 +174,14 @@ python -m scripts.paper_close_update
 ```
 
 ```bash
-# 手动跑一次牛市补选（补选窗口外跑会直接 noop）
+# 手动跑一次牛市补选 / 止损重选（窗口外跑会直接 noop）
 python -m scripts.live_signal --kind refill --dry-run
+
+# 只查持仓止损：有持仓且跌破 -10% 才推送，否则 noop
+python -m scripts.live_signal --kind stop --dry-run --force
 ```
 
-GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/rebalance/week/refill）
+GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/rebalance/week/refill/stop）
 与 `dry_run`。
 
 ## 五、候选池与标普 500 的调入调出
@@ -168,8 +205,8 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 4. **代码口径不一致** —— SSGA 写 `BRK.B`，行情源是 `BRK-B`，不归一就永远查不到。
    伯克希尔（标普 500 权重前 10）此前一直不在候选池里，就是这条造成的。
 
-⚠ **回测与实盘的池子口径仍不同**：回测用 `--pool-mode pit`（按官方公告重建逐日名单，
-锚点 503 只 + 期内补入 57 只），实盘用每日刷新的当前快照（`pool.load()`）。
+⚠ **回测与实盘的池子口径仍不同**：回测用池层的 `membership`（CRSP 逐日 PIT 区间，
+security_id 主键，窗口内 581 只曾当过成分股），实盘用每日刷新的当前快照（`pool.load()`）。
 两者都会随指数调整更新，但重建方式不同，且实盘还会多出 `BRK-B` / `BF-B` 这类
 行情源缺失的票。所以不要拿 live 的表现逐日对回测曲线，只能对「同一个月是否选了同一只」
 这种粒度。
@@ -190,7 +227,7 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
 | 牛熊 | SPY vs MA200，21 日跌破占比 ≥50% 判熊 | 同一口径 | 补选期间分支冻结在开启日，见「一之一」 |
 | 补选 | `--bull-refill` 逐日重挑 | `refill.json` + 每个交易日算一次 | 等待日不推送；分支冻结，避免中途翻熊乱买 ETF |
 | 成分股 | 2026-11-11 静态快照（492 只有行情） | 每日刷新 + 变更日志，代码归一 | live 比回测多 `BRK-B`/`BF-B`，两边口径不同，不可直接对曲线 |
-| 止损 | 不设 | 不设 | 单票满仓，回测最大回撤 −36.9%（pit 口径） |
+| 止损 | 收盘价 ≤ 买入价 × 0.90 当日割；割肉日 < 当月 11 号则重选（排除原票） | **已实现**（`--kind stop`，每交易日收盘前） | 回测用收盘价、实盘用收盘前 30 分钟现价，这是唯一近似；判据都走复权口径，见「一之一」 |
 | 市值门槛 | ≥500 亿美元，市值 = 未复权价 × 反推股本（全样本中位数） | 同一阈值，市值 = 未复权价 × **当日真实股本**（快照 → 反推 5 日 → SEC 三级兜底，逐票留来源） | 实盘不再用 3 年中位数（它会把拆股/回购后的股本算错）。503 只实测 500 亿门槛附近 **14 只**判定翻转；引用历史收益时要说明 |
 
 ## 七、已知风险（不是 bug，是取舍）
@@ -203,7 +240,8 @@ GitHub 上：Actions → paper-trade → Run workflow，可选 `kind`（auto/reb
    就只剩「手机没响」这一条线索。建议每周扫一眼 Actions 的绿点。
 4. **数据完整性闸只做到「拿不到就剔除并写进推送」**：某只票当天无报价会掉出候选，
    不会静默当作有数据。
-5. **没有风控层**：不设止损、不加仓位上限、不做组合分散。这是研究策略，不是资管产品。
+5. **没有组合层风控**：只有一条固定 10% 单票止损，不加仓位上限、
+   不做组合分散。这是研究策略，不是资管产品。
 
 ## 八、文件职责
 

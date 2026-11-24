@@ -1,22 +1,35 @@
 # 板块轮动 + 换手率选股 · 模拟盘
 
-标普 500 按 11 个 SPDR 板块 ETF 的 RSRS 排序选板块。牛市里板块内按 `turn20²/turn120` 取前 3，
-要求 strong 趋势五闸（MA20>MA60、两条均线 5 日斜率为正、收盘>MA50、MA50>MA200、ADX(14)>20），
-最多下探 3 个板块；熊市不碰个股，只买「RSRS 前 3 ∩ 120 日加权斜率前 3」里最强的板块 ETF。
-月末最后一个交易日**收盘前 30 分钟**决策，单票满仓、不设止损；调仓日空仓时牛市逐日补选到
-下一个调仓日。信号通过 pushplus 推送到微信，账本与决策日志提交回 `data` 分支。
+标普 500 按 10 个 SPDR 板块 ETF 的 RSRS 排序选板块（XLRE 板块层剔除）。牛市里板块内按
+`turn20²/turn120` 取前 3，要求 strong 趋势五闸（MA20>MA60、MA20 的 10 日与 MA60 的 5 日斜率为正、
+收盘>MA50、MA50>MA200、ADX(14)>10），最多下探 3 个板块；熊市不碰个股，只买
+「RSRS 前 3 ∩ 120 日加权斜率前 3」里最强的板块 ETF。月末最后一个交易日**收盘前 30 分钟**决策，
+单票满仓；**收盘价相对买入价跌 10% 当日割肉**，割肉日在当月 11 日之前则次日起逐日重选
+（排除刚割的那只），否则空仓到下一个调仓日；调仓日空仓时牛市逐日补选到下一个调仓日。
+信号通过 pushplus 推送到微信，账本与决策日志提交回 `data` 分支。
 
 定稿口径（与回测一一对应，改任一项都会与回测脱钩）：
 
 ```
 --n 20 --m 40 --pick turnma --turnma-top 3 --turnma-sectors 3
---trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60
---trend-above 50 --trend-cross 50,200 --adx-min 20
---turn-shares ws --turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
---min-mcap 500
+--trend-mode strong --trend-stack 20,60 --slope-mas 20:10,60:5
+--trend-above 50 --trend-cross 50,200 --adx-min 10
+--turn-rank-mode ratio --turn-cap 0.20 --turn-tail 0.48 --bull-refill
+--min-mcap 500 --exclude-sectors XLRE
 --regime-ma 200 --regime-window 21 --bear-etf-only --bear-rank both
 --bear-intersect-top 3 --bear-slope-window 120 --bear-min-score 0
+--stop-loss 0.10 --stop-repick-dom 11
 ```
+
+`--stop-loss 0.10` = 固定 10% 止损；`--stop-repick-dom 11` = 割肉日在该自然月 11 号之前才允许
+重新选股，且重选一律排除刚止损的那只。
+
+区间默认取池层的最后一天（含 2026 延展段时是 2026-11-13）；只要 CRSP 段就传 `--end 2025-12-31`。
+
+数据源只有一套：`data/curated/sp500_pool`（security_id = CRSP PERMNO 主键）。成分区间、复权价、
+成交量/总股本、当期市值、板块归属都来自它；ticker 只是展示用的别名，不参与选股。
+2025-12-31 之后（CRSP 数据包边界）由 `scripts/extend_pool_to_latest.py` 用本地行情按重叠区间
+缩放进同一价格空间，写成 `*_ext.parquet`（`src='local_ext'`），仍由同一个 `pool` 接口读取。
 
 市值门槛 500 亿美元是**数据清洗口径**（剔除换手率分母失真的小盘票），不是调参：
 100/200/300/500 四档的回测收益并不单调，阈值按经济理由定，不按收益挑。
@@ -24,18 +37,31 @@
 市值用**当日真实股本**算，不再用股本估算：Nasdaq 日快照（`market_cap / price`）→ 最近 5 日
 「成交量 ÷ 换手率」反推 → SEC 申报股本，逐级兜底，每只票的来源写进推送与 `candidates.csv`。
 
-**回测数据源（2026-11 修正）**：改用买来的标普 500 标准数据（CRSP 口径，`--data-source crsp`）——
-PIT 成分股、成交量÷总股本的真实换手率、当期真实市值、自带复权因子。旧口径用今天的 503 只快照
-回测过去，平均每期混入 58 只当时不在指数里的票、漏掉 58 只当时还在的票，累计收益虚高 2 倍以上
-（+638% vs +207%），且把最大回撤从 −41.6% 掩盖成 −25.8%：
+**回测数据源（2026-11 定稿）**：买来的标普 500 标准数据经 `scripts/build_sp500_pool.py` 清洗成
+`data/curated/sp500_pool`（security_id 主键）——PIT 成分区间、成交量÷总股本的真实换手率、
+当期真实市值、复权因子，以及成分期之前的外部预热段。旧口径用今天的 503 只快照回测过去，
+平均每期混入 58 只当时不在指数里的票、漏掉 58 只当时还在的票，累计收益虚高 2 倍以上：
 
-| 同区间（2021-11 ~ 2025-12，50 期） | 累计 | 年化 | 夏普 | 最大回撤 |
-|---|---|---|---|---|
-| 旧口径（本地快照 + 估算股本） | +637.9% | 62.7% | 1.52 | −25.8% |
-| **CRSP 标准数据** | **+207.1%** | **31.4%** | **1.02** | −41.6% |
-| SPY | +54.8% | 11.2% | 0.63 | −24.5% |
+| 版本 | 区间 | 累计 | 年化 | 夏普 | 最大回撤 |
+|---|---|---|---|---|---|
+| 旧口径（本地快照 + 估算股本，已作废） | 50 期 | +637.9% | 62.7% | 1.52 | −25.8% |
+| 旧 CRSP ticker 视图（已删除） | 50 期 | +207.1% | 31.4% | 1.02 | −41.6% |
+| **定稿：固定 10% 止损** | **50 期**（CRSP 段） | **+726.0%** | 67.3% | 2.24 | **−22.1%** |
+| **定稿：固定 10% 止损** | **61 期**（含 2026 延展段） | **+2835.5%** | 97.4% | **2.59** | −34.3% |
+| 对照：不设止损 | 50 期 | +832.3% | 72.2% | 2.30 | −22.1% |
+| 对照：不设止损 | 61 期 | +2472.2% | 92.1% | 2.40 | −36.7% |
+| SPY（同期 61 期） | 61 期 | +72.6% | 11.6% | 0.67 | −24.5% |
 
-证据与归因见 `docs/DATA_AUDIT_CRSP.md`。**引用收益只能引 CRSP 口径。**
+止损不是免费的：50 期收益从 +832.3% 降到 +726.0%、夏普 2.30→2.24，换来回撤从 −22.1% 持平；
+61 期因为 2026-03 那次割肉（F −18.2% → +5.4%，换 OXY）收益反而更高、回撤从 −36.7% 收到 −34.3%。
+61 期里只触发 4 次止损（2021-2024 一次都没有），样本极少，别把这段改善当稳定 alpha。
+
+2026 段的行情来自本地行情源（`scripts/extend_pool_to_latest.py` 把 2025-12-31 之后按重叠区间缩放进
+CRSP 价格空间，写回池层的 `*_ext.parquet`，`src='local_ext'`），不是 CRSP 原始数据；
+成分按 2026 公告回放。**2026 只有 10 期，累计 +274.3%，其中 3 期（SNDK 两期 +72.4%/+54.6%、
+MRNA +37.1%）贡献了绝大部分，这一段不能单独当成年化能力引用。**
+
+证据与归因见 `docs/DATA_AUDIT_CRSP.md`。**引用收益只能引池层口径。**
 
 ## 目录
 
@@ -66,11 +92,15 @@ src/quant/data/                     行情层（store/fetch/universe/sources）
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m scripts.sector_stock_rsrs --data-source crsp --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --stack-slope 5 --slope-mas 20,60 --trend-above 50 --trend-cross 50,200 --adx-min 20 --turn-shares ws --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2025-12-31 --tag crsp
+python -m scripts.sector_stock_rsrs --n 20 --m 40 --pick turnma --trend-mode strong --trend-stack 20,60 --slope-mas 20:10,60:5 --trend-above 50 --trend-cross 50,200 --adx-min 10 --turn-rank-mode ratio --bull-refill --turn-cap 0.20 --turn-tail 0.48 --min-mcap 500 --exclude-sectors XLRE --regime-ma 200 --regime-bear nofilter --regime-window 21 --bear-etf-only --bear-min-score 0 --bear-rank both --bear-intersect-top 3 --bear-slope-window 120 --start 2021-11-13 --end 2026-11-13 --stop-loss 0.10 --stop-repick-dom 11 --tag sl10dom11
 ```
 
-看板：`python -m scripts.build_web_report --pattern "*_merged" --out reports/web/index.html`，
+看板：`python -m scripts.build_web_report --pattern "*sl10dom11" --out reports/web/index.html`，
 产物为单文件 HTML（`reports/web/index.html`、`reports/web/bear_etfs.html`）。
+
+逐期走势图：`python -m scripts.build_picks_chart --pattern "*sl10dom11"`，产出
+`reports/web/picks.html`——每期一图，画该板块内换手率排序前 3 名的日线
+（信号日前 3 个月 → 持有期止），★ 标记实际买入的那只。
 
 ## 本地运行
 
@@ -104,4 +134,4 @@ Actions 的 run log 只保留 90 天，**不作为回溯依据**；证据在 `da
 
 ## 免责
 
-研究用途，不设止损、不做仓位管理，不是资管产品。
+研究用途，只有一条固定 10% 止损、不做仓位管理，不是资管产品。
