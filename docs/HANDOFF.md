@@ -29,27 +29,32 @@ Python 进程能正常读（白名单解密），所以**本地运行不受影�
 
 ### 1.1 一句话
 
-**先用 11 个 SPDR 板块 ETF 的 RSRS 选出最强的板块，再在该板块内按 20 日均换手率从高到低
-找前 3 只，买第一只均线多头排列的；月末最后一个交易日收盘前 30 分钟换仓，持有一个月。**
+**先用 11 个 SPDR 板块 ETF 的 RSRS 选出最强的板块。牛市里在该板块内按 `turn20²/turn120`
+从高到低找前 3 只，买第一只通过 strong 趋势五闸的；熊市不碰个股，直接买「RSRS 前 3 ∩
+120 日加权斜率前 3」里最强的板块 ETF，RSRS ≤0 就空仓。月末最后一个交易日收盘前 30 分钟换仓，
+持有一个月；调仓日空仓后，牛市逐日补选到下一个调仓日。**
 
 ### 1.2 决策链路（按执行顺序）
 
 | 步骤 | 输入 | 规则 | 输出 | 代码 |
 |---|---|---|---|---|
-| 1. 取行情 | data 分支的 parquet | 最近 400 天 high/low/adj_close，11 只 ETF + SPY + 约 503 只成分股 | 三个宽表 | `signal.compute` 前半 |
+| 1. 取行情 | data 分支的 parquet | 最近 520 天 high/low/adj_close，11 只 ETF + SPY + 约 503 只成分股 | 三个宽表 | `signal.compute` 前半 |
 | 2. 拼今日 bar | 实时报价（腾讯/新浪） | 现价 × 最近复权因子 → adj_close；盘中高低 → high/low | 尾部追加一行 | `signal._append_live_row` |
 | 3. 板块层 RSRS | ETF 的 high/low | N=20 回归、M=40 标准化、strict 过滤 | 11 个板块的 z 值 | `rsrs_panel_fast` |
-| 4. 全池换手率 | 19 天面板 + 当日累计 | `(sum19 + today) / 20`，有效天数 ≥10 | 每只票的 20 日均换手 | `turnover.build` |
-| 5. 换手率上限 | 上一步 | 20 日均换手 > 20% 的票当期剔除 | 可排序池 | `signal.compute` |
-| 6. 市值门槛 | 未复权价 × **当日真实股本** | < 500 亿美元的票当期剔除（取不到市值的**保留**）；股本按 快照 → 换手率反推 → SEC 三级兜底，逐票留来源 | 可排序池 | `mcap.gate` |
-| 7. 板块下探 | 板块 RSRS 降序 | 最多看前 3 个板块；每板块内按换手率降序取前 3 只 | 至多 9 个候选 | `signal.compute` 循环 |
-| 8. 多头排列 | 候选的 MA10/20/50 | MA10 > MA20 > MA50；遇到第一个满足的就买入并停止下探 | 1 只或空仓 | `signal.ma_of` |
-| 9. 执行 | 15:30 现价 | 市价单、单票满仓、持有一个月、不设止损 | 持仓 | 人工 |
+| 4. 牛熊 | SPY 与 MA200 | 过去 21 个交易日跌破占比 ≥50% 判熊；统计量 NaN 按牛市 | 分支开关 | `signal.compute` |
+| 5. 全池换手率 | 19 天面板 + 当日累计 | turn20 `(sum19+today)/20`（≥10 天）；turn120 同口径窗口 120（≥60 天） | 每只票两个均换手 | `turnover.build` / `mean_n` |
+| 6. 排序分 | 上一步 | `turn20²/turn120`；turn20 > 20% 的票当期剔除；turn120 不足的票不参与排序 | 可排序池 | `signal.compute` |
+| 7. 市值门槛 | 未复权价 × **当日真实股本** | < 500 亿美元的票当期剔除（取不到市值的**保留**）；股本按 快照 → 换手率反推 → SEC 三级兜底，逐票留来源 | 可排序池 | `mcap.gate` |
+| 8. 板块下探 | 板块 RSRS 降序 | 最多看前 3 个板块；每板块内按排序分降序取前 3 只 | 至多 9 个候选 | `signal.compute` 循环 |
+| 9. 趋势五闸 | 候选的均线/斜率/ADX | MA20>MA60、MA20/MA60 的 5 日斜率>0、收盘>MA50、MA50>MA200、ADX(14)>20，全 AND；命中即止 | 1 只或空仓 | `signal._gate` |
+| 10. 熊市 | 板块 RSRS ∩ 120 日斜率 | 交集内 RSRS 最强且 >0 → 买该 ETF；否则空仓 | 1 只 ETF 或空仓 | `signal.compute` bear 分支 |
+| 11. 执行 | 15:30 现价 | 市价单、单票满仓、持有一个月、不设止损 | 持仓 | 人工 |
+| 12. 补选 | 账本 `refill.json` | 调仓日空仓 + 牛市 → 每个交易日重算，命中即买；窗口到下一个调仓日，分支冻结 | 至多 1 次补选 | `live_signal._run` |
 
-**注意步骤 7 的两个"3"**：板块看前 3、每板块看前 3，是回测定稿参数（`TURNMA_SECTORS=3`、
+**注意步骤 8 的两个"3"**：板块看前 3、每板块看前 3，是回测定稿参数（`TURNMA_SECTORS=3`、
 `TURNMA_TOP=3`），改任一个都会让实盘与回测脱钩。
 
-**空仓是合法输出**：9 个候选都不满足多头排列 → 当期空仓，不动。回测里同样处理，
+**空仓是合法输出**：9 个候选都没过五闸 → 当期空仓，牛市转入逐日补选，熊市直接空着。
 不是异常，不要"兜底买一只"。
 
 ### 1.3 关键公式
@@ -181,7 +186,7 @@ journal.finish(0, "ok", detail)  # 写一行流水
 | `quotes.py` | 腾讯/新浪批量报价：价、盘中高低、累计量、换手率、数据源时间戳 | `Quote` / `fetch_quotes` / `describe_lag` | 腾讯字段序号会变，`_resolve_turnover` 用恒等式自校验，别改成硬编码下标 |
 | `turnover.py` | 20 日均换手率：历史面板 + 当日累计 | `TurnoverResult` / `build` / `load_history` / `median_of` | `TAIL_FACTOR` 固定 1.0，**不要**把回测的 0.48 抄进来 |
 | `pool.py` | 候选池：SSGA 官方 holdings 刷新、调入调出日志、代码归一（`BRK.B`→`BRK-B`） | `load` / `refresh` / `RefreshResult` / `diff` / `recent_changes` / `normalize_symbol` | 刷新失败必须沿用旧快照，绝不中断信号 |
-| `signal.py` | **策略核心**：板块 RSRS → 换手率 → 市值门槛 → 多头排列 → 下探 | `compute` / `Signal` / `Candidate` / `_append_live_row` / `ma_of` / `top_sectors` | 改排序逻辑只改这里；`pool_table` 是日志用的全池表，别删 |
+| `signal.py` | **策略核心**：牛熊 → （熊）板块 ETF / （牛）板块 RSRS → turn20²/turn120 → 市值门槛 → strong 五闸 → 下探 | `compute` / `Signal` / `Candidate` / `_append_live_row` / `_gate_panels` / `_gate` / `top_sectors` | 改排序/闸门逻辑只改这里；`pool_table` 是日志用的全池表，别删 |
 | `mcap.py` | 500 亿美元市值门槛，市值用**当日真实股本**（快照 → 反推 → SEC） | `MIN_MCAP` / `share_sources` / `gate` / `Gate` | 三级兜底的**顺序不能调**：SEC 表有洞（CHTR 最后一条停在 2016、FOX/A 值是 1 股），只配当最后兜底 |
 | `books.py` | 持仓、流水、幂等键；净值按"上一期实际收益"滚动 | `Position` / `load_position` / `plan_action` / `mark_to_market` / `record` / `already_pushed` | 「继续持有」也要记一行，否则净值曲线断档 |
 | `notify.py` | pushplus 推送，2000 字上限，以响应体 `code` 判成功 | `send` / `token` | 失败要打 `::error::` 让 job 变红 |
@@ -257,8 +262,10 @@ Occasion      # 一次推送场合
 ```
 
 `pool_table` 的 `reason` 取值与优先级（一只票只记**最先命中**的那个）：
+熊市全池记 `bear_regime`（被选中的 ETF 记 `selected_bear`）；牛市按
 `no_local_data` → `no_quote` → `small_mcap` → `no_turnover` → `turn_cap` →
-`not_in_top3` → `stack_fail` → `not_selected` → `""`（入选）。
+`no_turn120` → `not_in_top3` → `gate_fail` → `not_selected` → `""`（入选）。
+`gate_why` 列写明是哪一道闸没过（如「ADX 11.3 ≤ 20」「MA20 ≤ MA60」）。
 
 ---
 
@@ -325,7 +332,8 @@ state/live/decisions/YYYY-MM/<asof>_<run_id>/ 决策快照
 
 ### 8.1 已就绪
 
-- 策略链路完整：板块 RSRS → 换手率 → 500 亿市值门槛 → 多头排列 → 下探 → 推送 → 记账。
+- 策略链路完整：牛熊 → 板块 RSRS → turn20²/turn120 → 500 亿市值门槛 → strong 五闸 → 下探
+  （熊市：RSRS ∩ 120 日斜率 → 板块 ETF）→ 推送 → 记账 → 牛市补选。
 - 日志系统完整：运行流水（含全部失败路径）+ 决策快照 + 查询工具 + 完整文档。
 - 回测口径：PIT 成分名单、换手率补齐、市值门槛，36 期（2023-11 ~ 2026-10）
   累计 +1616.1%、夏普 3.024、最大回撤 −37.2%（500 亿档，`stats.csv` 日度净值口径）。
