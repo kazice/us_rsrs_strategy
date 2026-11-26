@@ -2,6 +2,9 @@
 data/
 logs/
 state/
+# 实盘账本（持仓/补选/幂等键）要进主仓，不能跟着旧的 state/ 一起被忽略
+!live/state/
+!live/state/**
 
 # 回测产物一律不入库，只跟踪网页看板（单文件 HTML，离线可看）
 reports/*

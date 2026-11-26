@@ -39,11 +39,11 @@ jobs:
     name: 信号与推送
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write          # 要回写 live/state/（持仓、补选、幂等键）
     steps:
       - name: 取代码
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Python
         uses: actions/setup-python@v5
@@ -80,6 +80,31 @@ jobs:
         run: |
           python live/signal.py --json \
             ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+
+      - name: 回写 live/state/
+        # 复盘（date）与试算（dry_run）都不该动账本
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run != 'true' && github.event.inputs.date == ''
+        run: |
+          git config user.name  "paper-trade-bot"
+          git config user.email "paper-trade-bot@users.noreply.github.com"
+          mkdir -p live/state            # 首次运行目录还不存在，git add 会报 pathspec
+          git add -A live/state
+          if git diff --cached --quiet; then
+            echo "账本无变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "state: $(date -u +%F' '%H:%MZ) run ${{ github.run_id }}"
+          for i in 1 2 3; do
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "账本已回写"
+              exit 0
+            fi
+            echo "push 失败（第 $i 次），rebase 后重试"
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+            sleep $((i * 3))
+          done
+          echo "::error::live/state 回写失败"
+          exit 1
 
   data:
     name: 盘后数据更新
