@@ -108,7 +108,7 @@ def build(bars: pd.DataFrame, etf: pd.DataFrame, mem: pd.DataFrame,
         f"口径：用 15:30 前实时报价合成 {today} 当日 bar"
         f"（{cover:.0%} 有真实区间，成交量按 {PART_TIME:.0%} 折全天）",
         "已知偏差：盘中高低比全天振幅略窄；成交价按 15:30 计，与收盘价有最后 30 分钟的差",
-        "板块 RSRS 用表内 raw 重算归一化：表内 rsrs20_40_z 与 raw 不自洽，不能直接沿用",
+        "板块 RSRS 按表内 raw 的 40 日窗口归一化（与 update_etf 同口径）",
     ]
     return bars_day, etf_day, mem_day, today, notes
 
@@ -185,8 +185,9 @@ def _etf_rows(etf, quotes, ktab, today) -> pd.DataFrame | None:
         y = list(g.high.to_numpy(float)[-19:]) + [max(q.high, q.price) * k]
         x = list(g.low.to_numpy(float)[-19:]) + [min(q.low or q.price, q.price) * k]
         raw_now = _rsrs_raw(y, x)
-        # 归一化窗口是「今天之前的 40 个 raw」，必须排除当天，口径与 rsrs_z 一致
-        hist = g.rsrs20_40_raw.iloc[:-1].tail(40).dropna()
+        # 归一化窗口是「今天之前的 40 个 raw」。传进来的 etf 面本来就不含今天
+        # （build 在日期已入库时直接返回），所以直接 tail(40)，不能再 iloc[:-1]。
+        hist = g.rsrs20_40_raw.tail(40).dropna()
         z = float("nan")
         if len(hist) >= 20 and float(hist.std()) > 0 and pd.notna(raw_now):
             z = (raw_now - float(hist.mean())) / float(hist.std())
@@ -205,8 +206,14 @@ def _etf_rows(etf, quotes, ktab, today) -> pd.DataFrame | None:
         return None
 
     df = pd.DataFrame(rows)
-    if spy_close is not None and len(spy_close) >= 220:
-        ma200 = spy_close.rolling(200, min_periods=200).mean()
-        below = (spy_close < ma200).astype(float).where(ma200.notna())
-        df.loc[df.etf_symbol == BENCH, "bear_ratio21"] = float(below.tail(21).mean())
+    # bear_ratio21 只有 SPY 有意义。历史 20 天直接用表内 ma200（它带更长预热），
+    # 只把今天补进去，避免自己重算 200 日线时因起点不同差出一天。
+    spy_row = df[df.etf_symbol == BENCH]
+    if len(spy_row):
+        g = etf[etf.etf_symbol == BENCH].sort_values("date")
+        below = (g.close < g.ma200).astype(float).where(g.ma200.notna())
+        px = float(spy_row.close.iloc[0])
+        ma_now = float(pd.concat([g.close, pd.Series([px])], ignore_index=True).tail(200).mean())
+        seq = list(below.tail(20).dropna()) + [float(px < ma_now)]
+        df.loc[df.etf_symbol == BENCH, "bear_ratio21"] = float(pd.Series(seq).mean())
     return df

@@ -178,6 +178,20 @@ def main() -> int:
     cand = cand[cols]
     merged = pd.concat([base, cand], ignore_index=True)
     merged = merged.drop_duplicates(["etf_symbol", "date"], keep="first")
+
+    # 合并后重算 raw/z。keep="first" 会让重叠区的 raw 来自 base、z 来自 cand，
+    # 两列不是同一条序列（z 复现不出、实盘板块名次对不上回测）。
+    # 这里用合并后的 high/low 统一重算一次，必须在裁剪到 OUTPUT_START 之前做，
+    # 否则前 40 行没有预热窗口。
+    fixed = []
+    for s, g in merged.groupby("etf_symbol", observed=True):
+        g = g.sort_values("date").reset_index(drop=True)
+        raw, z = rsrs_z(g.high.to_numpy(float), g.low.to_numpy(float))
+        g["rsrs20_40_raw"] = raw
+        g["rsrs20_40_z"] = z
+        fixed.append(g)
+    merged = pd.concat(fixed, ignore_index=True)
+
     merged = merged[merged.date >= pd.Timestamp(OUTPUT_START)].sort_values(["etf_symbol", "date"])
 
     # 状态列
