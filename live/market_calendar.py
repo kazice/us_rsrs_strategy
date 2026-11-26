@@ -97,18 +97,20 @@ def holidays(year: int) -> frozenset[dt.date]:
 
 
 def early_closes(year: int) -> frozenset[dt.date]:
-    """13:00 ET 收盘的日子。"""
+    """13:00 ET 收盘的日子。
+
+    只有「节日当天本身是工作日」才有提前收盘。节日落在周六/周日时，休市日顺延到
+    前一个周五/后一个周一，前一天是正常交易日——不能拿 _observed() 的结果再往前推一天，
+    否则 2026-07-02、2027-12-23 这种本来正常的日子会被当成 13:00 收盘。
+    """
     thanksgiving = _nth_weekday(year, 11, 3, 4)
     out = {thanksgiving + dt.timedelta(days=1)}            # 黑色星期五
-    july4 = _observed(dt.date(year, 7, 4))
-    if july4.weekday() < 5 and july4.month == 7 and july4.day <= 4:
-        eve = july4 - dt.timedelta(days=1)
+    for holiday in (dt.date(year, 7, 4), dt.date(year, 12, 25)):
+        if holiday.weekday() >= 5:                         # 节日在周末 -> 前一天不早收
+            continue
+        eve = holiday - dt.timedelta(days=1)
         if eve.weekday() < 5:
-            out.add(eve)                                   # 7/3
-    xmas = _observed(dt.date(year, 12, 25))
-    eve = xmas - dt.timedelta(days=1)
-    if eve.weekday() < 5:
-        out.add(eve)                                       # 12/24
+            out.add(eve)                                   # 7/3、12/24
     return frozenset(d for d in out if d.weekday() < 5)
 
 
