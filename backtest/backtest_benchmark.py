@@ -15,7 +15,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
+import shutil
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +28,8 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = ROOT / "latest_data"      # 默认用基板数据；传 --data-dir upload 即用实盘数据
-OUT_DEFAULT = ROOT / "reports" / "bt_v2"
+BASELINE_DIR = ROOT / "reports" / "baseline"   # 基线固定放这里
+LOGS_DIR = ROOT / "logs"                       # 参数试验按时间戳归档
 
 SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLC"]
 BENCH = "SPY"
@@ -39,6 +45,30 @@ BEAR_TOPN = 3
 BEAR_RATIO = 0.5      # 过去 21 日中跌破 MA200 的比例阈值
 
 DEFAULT_START = "2021-12-31"   # 策略定义的回测起点
+
+PARAM_KEYS = ["ADX_MIN", "MCAP_MIN", "TURN_CAP", "TOPN_SECTOR", "TOPN_STOCK",
+              "STOP_LOSS", "REFILL_DAY", "BEAR_TOPN", "BEAR_RATIO", "DEFAULT_START"]
+
+
+def run_dir(tag: str) -> Path:
+    """一次回测 = 一个目录。
+
+    baseline 是正式基线，固定落在 reports/baseline；其它 tag 视为改参数的试验，
+    按时间戳落到 logs/<时间戳>_<tag>/，以免和基线混在一起。
+    """
+    tag = (tag or "baseline").strip()
+    if tag == "baseline":
+        return BASELINE_DIR
+    return LOGS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}"
+
+
+def _dashboard_mod():
+    spec = importlib.util.spec_from_file_location(
+        "make_dashboard", ROOT / "backtest" / "make_dashboard.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["make_dashboard"] = m
+    spec.loader.exec_module(m)
+    return m
 
 
 @dataclass
@@ -293,7 +323,9 @@ def main() -> int:
                     help=f"默认 {DEFAULT_START}；数据不足时自动退到数据首日")
     ap.add_argument("--end", default=None, help="默认取数据末日（跟随 upload 更新）")
     ap.add_argument("--cost", type=float, default=0.0005)
-    ap.add_argument("--tag", default="v2")
+    ap.add_argument("--tag", default="baseline",
+                    help="baseline = 正式基线（落 reports/baseline）；其它名字 = 参数试验，"
+                         "按时间戳落 logs/<时间戳>_<tag>/")
     ap.add_argument("--dump-candidates", action="store_true")
     a = ap.parse_args()
 
@@ -308,7 +340,7 @@ def main() -> int:
     spy = etf[etf.etf_symbol == BENCH].set_index("date").close.reindex(nav.index).ffill().bfill()
     bench = spy / spy.iloc[0]
 
-    out = OUT_DEFAULT / f"bt_{a.tag}"
+    out = run_dir(a.tag)
     out.mkdir(parents=True, exist_ok=True)
     nav["nav"].to_csv(out / "nav_daily.csv")
     nav["hold"].to_csv(out / "hold_daily.csv")
@@ -320,15 +352,46 @@ def main() -> int:
 
     st = pd.DataFrame({"策略": perf(nav["nav"]), "SPY": perf(bench)})
     st.to_csv(out / "stats.csv")
+
+    # 参数落盘：事后翻这个目录就知道这轮跑的是什么口径
+    cash_ratio = float((nav["hold"] == "cash").mean())
+    params = {
+        "tag": a.tag,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "data_dir": data_dir.name,
+        "start": str(nav.index.min().date()),
+        "end": str(nav.index.max().date()),
+        "cost": a.cost,
+        "strategy": {k: globals().get(k) for k in PARAM_KEYS},
+        "summary": {
+            "trades": int(len(trades)),
+            "stops": int((trades.reason == "stop_loss").sum()) if len(trades) else 0,
+            "win": round(float((trades.ret > 0).mean()), 4) if len(trades) else 0.0,
+            "avg_ret": round(float(trades.ret.mean()), 6) if len(trades) else 0.0,
+            "cash_ratio": round(cash_ratio, 4),
+        },
+    }
+    (out / "params.json").write_text(
+        json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print(f"=== 回测 benchmark  数据={data_dir.name}  "
           f"{nav.index.min().date()} ~ {nav.index.max().date()} ===")
     print(st.to_string(float_format=lambda x: f"{x:.4f}"))
     if len(trades):
         print(f"\n交易 {len(trades)} 笔 | 止损 {int((trades.reason == 'stop_loss').sum())} 次 | "
               f"胜率 {(trades.ret > 0).mean()*100:.1f}% | 平均单笔 {trades.ret.mean()*100:.2f}%")
-    cash_ratio = (nav["hold"] == "cash").mean()
     print(f"空仓天数占比 {cash_ratio*100:.1f}%")
     print(f"\n产出: {out}")
+
+    # 同一个 run 目录里直接出看板；baseline 额外同步一份到 reports/index.html
+    try:
+        md = _dashboard_mod()
+        md.write_run(out, out / "index.html")
+        if out == BASELINE_DIR:
+            shutil.copy2(out / "index.html", ROOT / "reports" / "index.html")
+        print(f"看板: {out / 'index.html'}")
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"看板生成失败（不影响回测）：{type(exc).__name__}: {exc}")
     return 0
 
 

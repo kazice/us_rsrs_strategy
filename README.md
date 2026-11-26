@@ -105,10 +105,41 @@ python upload/update_all.py
 | 空仓天数占比 | 13.6% | — |
 
 ```powershell
-python backtest/backtest_benchmark.py --tag v1
+python backtest/backtest_benchmark.py
 ```
 
-产出：`reports/bt_v2/bt_<tag>/`（`nav_daily.csv`、`hold_daily.csv`、`holds.csv`、`stats.csv`）。
+产出到 `reports/baseline/`（`nav_daily.csv`、`hold_daily.csv`、`holds.csv`、`stats.csv`、
+`params.json`、`index.html`）。
+
+## 回测与看板
+
+```powershell
+python backtest/backtest_benchmark.py                # 正式基线 → reports/baseline/
+python backtest/backtest_benchmark.py --tag adx12    # 参数试验 → logs/<时间戳>_adx12/
+```
+
+**一次回测 = 一个目录**，数据和看板都在里面：
+
+```
+reports/baseline/
+  nav_daily.csv  hold_daily.csv  bench_spy.csv  holds.csv  stats.csv
+  params.json     本轮口径（ADX/市值/换手/板块数/止损/补选日/熊市阈值）+ 区间 + 汇总
+  index.html      这一轮的调仓看板
+```
+
+- `--tag baseline`（默认）固定写 `reports/baseline/`，并同步一份看板到 `reports/index.html`
+- 其它 tag 视为**改参数的试验**，按时间戳落到 `logs/<时间戳>_<tag>/`，不会污染基线
+- 想看某轮改了什么，直接对比两个目录的 `params.json`
+
+看板用法：明细列表里点任意一行，就地展开该期的日线（买入前 3 个月 ~ 卖出后 1 个月，
+叠加 MA20/MA60，▲ 买入 ▼ 卖出）；「锁定展开」可同时摊开多期；`index.html#12` 直达第 12 期。
+
+单独重建某轮的看板：
+
+```powershell
+python backtest/make_dashboard.py --run reports/baseline
+python backtest/make_dashboard.py --run logs/20261127_003624_adx12 --open
+```
 
 ## 数据说明
 
