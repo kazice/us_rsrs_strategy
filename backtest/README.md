@@ -133,7 +133,8 @@ python backtest/backtest_benchmark.py --tag adx12     # 改参数的试验 → l
 | `candidates.csv` | 9 只候选池及是否过闸（需 `--dump-candidates`） |
 | `stats.csv` | 绩效汇总 |
 | `params.json` | 本轮口径常量（ADX/市值/换手/板块数/止损…） |
-| `index.html` | 这一轮的调仓看板 |
+
+看板不在 run 目录里：基线写 `reports/index.html`，参数试验写 `logs/<时间戳>_<tag>/index.html`。
 
 ## 11. 回测结果（2022-01-03 ~ 2026-11-13）
 

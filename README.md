@@ -118,17 +118,26 @@ python backtest/backtest_benchmark.py                # 正式基线 → reports/
 python backtest/backtest_benchmark.py --tag adx12    # 参数试验 → logs/<时间戳>_adx12/
 ```
 
-**一次回测 = 一个目录**，数据和看板都在里面：
+**一次回测 = 一个数据目录**，看板固定放 `reports/index.html`，不重复：
 
 ```
-reports/baseline/
-  nav_daily.csv  hold_daily.csv  bench_spy.csv  holds.csv  stats.csv
-  params.json     本轮口径（ADX/市值/换手/板块数/止损/补选日/熊市阈值）+ 区间 + 汇总
-  index.html      这一轮的调仓看板
+reports/
+  index.html      调仓看板（基线的那一份）
+  baseline/       基线数据
+    nav_daily.csv  hold_daily.csv  bench_spy.csv  holds.csv  stats.csv
+    params.json   本轮口径（ADX/市值/换手/板块数/止损/补选日/熊市阈值）+ 区间 + 汇总
 ```
 
-- `--tag baseline`（默认）固定写 `reports/baseline/`，并同步一份看板到 `reports/index.html`
-- 其它 tag 视为**改参数的试验**，按时间戳落到 `logs/<时间戳>_<tag>/`，不会污染基线
+参数试验则是完整一套（数据 + 看板副本）落到 `logs/<时间戳>_<tag>/`：
+
+```
+logs/20261127_003624_adx12/
+  nav_daily.csv ... stats.csv  params.json
+  index.html      这一轮的看板，和 reports/index.html 并排对照
+```
+
+- `--tag baseline`（默认）写 `reports/baseline/`，看板写 `reports/index.html`
+- 其它 tag 视为**改参数的试验**，按时间戳归档在 `logs/`，不会污染基线
 - 想看某轮改了什么，直接对比两个目录的 `params.json`
 
 看板用法：明细列表里点任意一行，就地展开该期的日线（买入前 3 个月 ~ 卖出后 1 个月，

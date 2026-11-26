@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -386,13 +385,11 @@ def main() -> int:
     print(f"空仓天数占比 {cash_ratio*100:.1f}%")
     print(f"\n产出: {out}")
 
-    # 同一个 run 目录里直接出看板；baseline 额外同步一份到 reports/index.html
+    # 出看板：baseline 写 reports/index.html，其它 run 写自己目录
     try:
         md = _dashboard_mod()
-        md.write_run(out, out / "index.html")
-        if out == BASELINE_DIR:
-            shutil.copy2(out / "index.html", ROOT / "reports" / "index.html")
-        print(f"看板: {out / 'index.html'}")
+        md.write_run(out)
+        print(f"看板: {md.dashboard_path(out)}")
     except Exception as exc:                                  # noqa: BLE001
         print(f"看板生成失败（不影响回测）：{type(exc).__name__}: {exc}")
     return 0

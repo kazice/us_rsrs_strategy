@@ -6,8 +6,8 @@
 买入 ▲、卖出 ▼ 都打在当日收盘价上。图表在展开时才创建，
 不依赖"先切页再画"的时机（之前画不出来就是这个原因）。
 
-看板写在 run 目录里（reports/baseline/index.html 或 logs/<时间戳>_<tag>/index.html），
-回测脚本跑完会自动调一次。参数试验的看板随 run 一起按时间戳归档在 logs/。
+看板位置：baseline 统一写到 reports/index.html（不放进 baseline 目录，避免重复）；
+参数试验随 run 一起写到 logs/<时间戳>_<tag>/index.html。回测跑完会自动调一次。
 
 用法：
     python backtest/make_dashboard.py                      # 用 reports/baseline
@@ -26,7 +26,8 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_DEFAULT = ROOT / "reports" / "baseline"   # 基线产出目录
+RUN_DEFAULT = ROOT / "reports" / "baseline"     # 基线产出目录
+OUT_DEFAULT = ROOT / "reports" / "index.html"   # 基线看板（不放在 baseline 里，避免重复）
 
 ETFS = {"SPY", "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI",
         "XLB", "XLU", "XLC", "XLRE"}
@@ -138,10 +139,15 @@ def render(data: dict) -> str:
                             json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
+def dashboard_path(run: Path) -> Path:
+    """看板落在哪：baseline 统一放 reports/index.html，其它 run 放自己目录里。"""
+    return OUT_DEFAULT if run.resolve() == RUN_DEFAULT.resolve() else run / "index.html"
+
+
 def write_run(run: Path, out_html: Path | None = None) -> dict:
-    """给一个 run 目录出看板，默认写在它自己里面。回测脚本直接调这个。"""
+    """给一个 run 目录出看板。回测脚本直接调这个。"""
     data = build(run)
-    target = Path(out_html) if out_html else run / "index.html"
+    target = Path(out_html) if out_html else dashboard_path(run)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render(data), encoding="utf-8")
     return data
@@ -165,7 +171,8 @@ def _report(data: dict, run: Path, out: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default=str(RUN_DEFAULT), help="回测产出目录")
-    ap.add_argument("--out", default=None, help="看板输出路径，默认 <run>/index.html")
+    ap.add_argument("--out", default=None,
+                    help="看板输出路径，默认 baseline → reports/index.html，其它 → <run>/index.html")
     ap.add_argument("--open", action="store_true", help="生成后用浏览器打开")
     a = ap.parse_args()
 
@@ -173,7 +180,7 @@ def main() -> int:
     if not (run / "holds.csv").exists():
         print(f"找不到 {run/'holds.csv'}，先跑 backtest_benchmark.py")
         return 1
-    out = Path(a.out) if a.out else run / "index.html"
+    out = Path(a.out) if a.out else dashboard_path(run)
     data = write_run(run, out)
     _report(data, run, out)
     if a.open:
