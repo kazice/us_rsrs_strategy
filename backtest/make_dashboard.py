@@ -200,6 +200,8 @@ TEMPLATE = r"""<!doctype html>
     --up:#f85149; --down:#3fb950; --accent:#4493f8; --mark:#f0883e;
   }
   *{box-sizing:border-box}
+  /* 展开一行会让页面变长、滚动条出现，不预留槽位内容会被挤窄 15px */
+  html{overflow-y:scroll;scrollbar-gutter:stable}
   body{margin:0;background:var(--bg);color:var(--fg);overflow-anchor:none;
        font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
   .wrap{max-width:1180px;margin:0 auto;padding:18px 20px 60px}
@@ -216,10 +218,12 @@ TEMPLATE = r"""<!doctype html>
   .kpi .lab{color:var(--dim);font-size:12px}
   .kpi .val{font-size:19px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
   .up{color:var(--up)} .down{color:var(--down)} .dim{color:var(--dim)}
-  table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+  table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;
+        font-variant-numeric:tabular-nums}
   th{color:var(--dim);font-weight:500;text-align:left;padding:9px 10px;
      border-bottom:1px solid var(--line);font-size:12px;position:sticky;top:0;background:var(--panel)}
   td{padding:9px 10px;border-bottom:1px solid #1b2027}
+  tr.row td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   tr.row{cursor:pointer}
   tr.row:hover{background:#1c2330}
   tr.row.open{background:#1b2432}
@@ -266,8 +270,15 @@ TEMPLATE = r"""<!doctype html>
 
   <div class="card" style="padding:0;overflow:hidden">
     <table>
+      <colgroup>
+        <col style="width:30px"><col style="width:46px">
+        <col style="width:100px"><col style="width:100px">
+        <col><col style="width:64px">
+        <col style="width:84px"><col style="width:84px"><col style="width:88px">
+        <col style="width:72px"><col style="width:92px">
+      </colgroup>
       <thead><tr>
-        <th style="width:34px"></th><th>#</th><th>买入</th><th>卖出</th><th>代码</th><th>板块</th>
+        <th></th><th>#</th><th>买入</th><th>卖出</th><th>代码</th><th>板块</th>
         <th class="num">买入价</th><th class="num">卖出价</th><th class="num">收益</th>
         <th class="num">持有天</th><th>原因</th>
       </tr></thead>
