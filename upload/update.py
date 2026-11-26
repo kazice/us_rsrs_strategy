@@ -335,11 +335,17 @@ def main() -> int:
     result = pd.concat(out_frames, ignore_index=True)
     result = result[result.date >= pd.Timestamp(OUTPUT_START)].sort_values(["permno", "date"])
 
-    # 只保留信号日仍在册的成分股（约 503 只），剔除期内已退市的票
-    alive = mem0.loc[mem0.date == last, "permno"].unique()
+    # 只保留最新交易日在册的成分股（约 503 只），剔除期内已退市的票。
+    # 必须用 upload/members_daily 的最新一天：latest_data 的 mem0 冻结在基线日，
+    # 用它会把 update_members 新分配的 permno（1_000_001+）全部滤掉，新票永远进不来。
+    mem_new_path = OUT / "members_daily.parquet"
+    mem_alive = pd.read_parquet(mem_new_path) if mem_new_path.exists() else mem0
+    mem_alive = mem_alive[mem_alive.date <= result.date.max()]
+    alive_day = mem_alive.date.max()
+    alive = mem_alive.loc[mem_alive.date == alive_day, "permno"].astype("int64").unique()
     before = result.permno.nunique()
     result = result[result.permno.isin(alive)].reset_index(drop=True)
-    print(f"成分股过滤: {before} -> {result.permno.nunique()} 只")
+    print(f"成分股过滤（{alive_day.date()} 在册）: {before} -> {result.permno.nunique()} 只")
 
     print(f"输出 {len(result):,} 行, {result.date.min().date()} ~ {result.date.max().date()}")
 

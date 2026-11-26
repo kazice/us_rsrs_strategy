@@ -1,0 +1,168 @@
+name: paper-trade
+
+# 触发：Cloudflare Worker 的每日一次性 cron 调 workflow_dispatch（准点）；
+# 下面那条 schedule 只做兜底，GitHub 自身会延迟数小时，不能当主力。
+#
+# 不空跑：两个 job 都先跑闸门，不在窗口内直接 exit 0，既不推送也不回写。
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '复现用信号日 YYYY-MM-DD（留空 = 数据最新日）'
+        default: ''
+      force:
+        description: '无视窗口与日历判定（仅排错用，会真的推送）'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      dry_run:
+        description: '只算不推'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+  schedule:
+    - cron: '30 21 * * 1-5'
+
+concurrency:
+  group: paper-trade
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  signal:
+    name: 信号与推送
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install -q "pandas>=2.0" "numpy>=1.24" "pyarrow>=14.0"
+
+      - name: 判定今天要不要跑
+        id: gate
+        run: |
+          set +e
+          python live/signal.py --check ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "10" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: 算信号并推送
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run != 'true'
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          python live/signal.py --push \
+            ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+
+      - name: 试算（不推送）
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run == 'true'
+        run: |
+          python live/signal.py --json \
+            ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+
+  data:
+    name: 盘后数据更新
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install -q "pandas>=2.0" "numpy>=1.24" "pyarrow>=14.0" "requests>=2.31"
+
+      - name: 判定是否已收盘
+        id: gate
+        run: |
+          set +e
+          python live/gate.py data
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "10" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: 更新 upload/ 三张表
+        if: steps.gate.outputs.skip == 'false'
+        run: python upload/update_all.py
+
+      - name: 回写 upload/
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          git config user.name  "paper-trade-bot"
+          git config user.email "paper-trade-bot@users.noreply.github.com"
+          git add upload/
+          if git diff --cached --quiet; then
+            echo "无变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "data: $(date -u +%F' '%H:%MZ) run ${{ github.run_id }}"
+          for i in 1 2 3; do
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "已回写 ${{ github.ref_name }}"
+              exit 0
+            fi
+            echo "push 失败（第 $i 次），rebase 后重试"
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+            sleep $((i * 3))
+          done
+          echo "::error::upload/ 回写失败"
+          exit 1
+
+  next-trigger:
+    # 闭环：每次跑完算出下一次 signal / data 的精确 UTC 时刻，
+    # 写成一次性日期 cron 推给 Cloudflare。缺了这个 job，Cloudflare 的 cron
+    # 会停在最后一次的值，夏令时切换后整体偏一小时。
+    name: 更新下次触发时刻
+    needs: [signal, data]
+    if: always() && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 同步 Cloudflare Cron
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python live/cron_sync.py sync

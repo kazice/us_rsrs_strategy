@@ -37,7 +37,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-import calendar as cal  # noqa: E402
+import market_calendar as cal  # noqa: E402
 
 MARK = ROOT / "state" / "dispatch_mark.json"
 

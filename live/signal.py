@@ -15,13 +15,33 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = ROOT / "upload"    # 实盘默认读 upload（每日自动更新），可 --data-dir 覆盖
+HERE = Path(__file__).resolve().parent
+
+
+def _load_local(mod_name: str, path: Path):
+    """按文件加载同目录模块。
+
+    不能把 live/ 前插进 sys.path：目录里的本地模块会遮蔽同名的标准库
+    （calendar.py 就让 pandas 的 _strptime 崩过一次）。
+    """
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod          # dataclass 处理注解时需要模块已注册
+    spec.loader.exec_module(mod)
+    return mod
+
+
+cal = _load_local("market_calendar", HERE / "market_calendar.py")
 
 SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLC"]
 BENCH = "SPY"
@@ -57,6 +77,64 @@ def load(data_dir: Path):
     return bars, etf, mem
 
 
+def occasion_kind(d: dt.date) -> str:
+    """今天该做什么：rebalance（月末最后交易日）/ week（周内最后交易日）/ none。"""
+    if not cal.is_trading_day(d):
+        return "none"
+    if cal.month_end_trading_day(d) == d:
+        return "rebalance"
+    if cal.week_end_trading_day(d) == d:
+        return "week"
+    return "none"
+
+
+def _check(force: bool = False) -> int:
+    """只判「今天该不该跑」，不读数据、不算信号。
+
+    退出码：0 = 该跑；10 = 不该跑（workflow 用 == '10' 跳过，不当作失败）。
+    窗口也要判：早到会用到未收盘的当日数据，晚到信号已经过时，两头都必须拒绝。
+    """
+    now = dt.datetime.now(cal.UTC)
+    today = now.astimezone(cal.ET).date()
+    occ = cal.occasion_for(today)
+    kind = occasion_kind(today)
+    print(f"{today} {occ.reason}")
+    if kind == "none":
+        print("非调仓日 / 非周末最后交易日，跳过")
+        return 10
+    if not force and not cal.in_window(now, occ, 5, 40):
+        print(f"不在收盘前 {cal.TRIGGER_LEAD_MIN} 分钟窗口内，跳过")
+        return 10
+    print(f"kind={kind} 收盘 {occ.close_et} ET = {occ.close_utc:%H:%M}Z "
+          f"触发 {occ.trigger_utc:%H:%M}Z")
+    return 0
+
+
+def _render_push(out: dict) -> tuple[str, str]:
+    """把算出来的信号压成一条 pushplus 消息。"""
+    kind = {"rebalance": "调仓", "week": "周报"}.get(out.get("kind", ""), "信号")
+    title = f"[实盘] {out['signal_date']} {kind}：{out['action']}"
+    lines = [
+        f"## {out['signal_date']} {kind}",
+        "",
+        f"**状态**：{out['regime']}（SPY 跌破 MA200 占比 {out['spy_bear_ratio21']}）",
+        "",
+        f"**结论**：{out['action']}",
+        "",
+    ]
+    if out["sector_rank"]:
+        lines.append("**板块 RSRS**")
+        for i, s in enumerate(out["sector_rank"][:5], 1):
+            lines.append(f"{i}. {s['etf']} {s['rsrs_z']:+.3f}")
+        lines.append("")
+    if out["candidates"]:
+        lines.append("**候选池**")
+        for c in out["candidates"]:
+            flag = "通过" if c["pass"] else "淘汰(" + ",".join(c["fail_on"]) + ")"
+            lines.append(f"- {c['symbol']}（{c['sector']}）{flag}")
+    return title[:100], "\n".join(lines)
+
+
 def gate_detail(r) -> tuple[bool, list[str]]:
     fails = []
     vals = [r.ma20, r.ma50, r.ma60, r.ma200, r.slope20_10d, r.slope60_5d, r.adx14, r.close]
@@ -74,7 +152,16 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--hold", default=None, help="当前持仓代码，用于判断是否需要换仓")
     ap.add_argument("--data-dir", default=str(DEFAULT_DATA), help="数据目录，默认 upload")
+    ap.add_argument("--check", action="store_true",
+                    help="只判今天该不该跑（不读数据、不算信号），用于 workflow 提前退出")
+    ap.add_argument("--push", action="store_true",
+                    help="算完推送到 pushplus（需要 PUSHPLUS_TOKEN 环境变量）")
+    ap.add_argument("--force", action="store_true",
+                    help="配合 --check：无视窗口判定（手工验证用）")
     a = ap.parse_args()
+
+    if a.check:
+        return _check(a.force)
 
     data_dir = Path(a.data_dir)
     if not data_dir.is_absolute():
@@ -100,6 +187,7 @@ def main() -> int:
 
     out = {
         "signal_date": str(dt.date()),
+        "kind": occasion_kind(dt.date()),
         "regime": "熊市" if is_bear else "牛市",
         "spy_bear_ratio21": None if pd.isna(bear_ratio) else round(bear_ratio, 4),
         "sector_rank": [],
@@ -171,6 +259,13 @@ def main() -> int:
             out["action"] = f"卖出 {a.hold.upper()} → 买入 {out['pick']['symbol']}"
         else:
             out["action"] = f"卖出 {a.hold.upper()} → 空仓"
+
+    if a.push:
+        notify = _load_local("live_notify", HERE / "notify.py")
+        title, body = _render_push(out)
+        if not notify.send(title, body):
+            return 2
+        print(f"已推送：{title}")
 
     if a.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
