@@ -319,9 +319,11 @@ def _run_rebalance(out: dict, pos, a, bars, etf, ktab) -> int:
             books.clear_refill("熊市空仓，不开补选")
         else:
             books.clear_refill("已建仓")
-
-    if a.push and _push(out):
+        # 先落幂等键再推送：推送失败时账本也不能被下一次重跑再记一遍
         books.mark_pushed("rebalance", out["signal_date"], {"action": action})
+
+    if a.push and not _push(out):
+        return 2
     return 0
 
 
@@ -360,7 +362,11 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
         return 0
 
     today = dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(cal.ET).date()
-    action = f"止损卖出 {pos.symbol}（{ret_s}）"
+    if not a.replay and books.already_pushed("stop", str(today)):
+        print(f"{today} 已做过止损检查，跳过")
+        return 0
+    sold = pos.symbol                     # record_stop 会清掉 pos.symbol，先留住
+    action = f"止损卖出 {sold}（{ret_s}）"
     allow = today.day < STOP_REPICK_DOM and int(pos.stop_retry) == 0
     print(f"{action}｜{'本月可重选' if allow else '本月不再重选'}")
 
@@ -371,14 +377,16 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
                       note="止损", retry_used=1 if allow else pos.stop_retry)
     if allow:
         books.set_refill(since=str(today), until=str(next_month_end(today)),
-                         bull=True, exclude=pos.symbol, origin="stop")
+                         bull=True, exclude=sold, origin="stop")
 
     out = {"signal_date": str(today), "kind": "stop", "regime": "-",
            "spy_bear_ratio21": None, "sector_rank": [], "candidates": [],
            "action": action,
-           "position_line": f"**当前持仓**：{pos.symbol}｜持有期 {ret_s}｜现价 {q:.2f}"}
-    if a.push and _push(out, [f"补选：{'次一交易日起逐日重挑（排除 ' + pos.symbol + '）' if allow else '本月不再重选'}"]):
-        books.mark_pushed("stop", str(today))
+           "position_line": f"**已清仓**：{sold}｜持有期 {ret_s}｜卖出价 {q:.2f}"}
+    tail = f"补选：{'次一交易日起逐日重挑（排除 ' + sold + '）' if allow else '本月不再重选'}"
+    books.mark_pushed("stop", str(today), {"action": action[:60]})
+    if a.push and not _push(out, [tail]):
+        return 2
     return 0
 
 
@@ -416,8 +424,9 @@ def _run_refill(out: dict, pos, refill: dict, a, bars, etf, ktab) -> int:
                  target=target, target_kind=kind, sector=out["pick"].get("sector", ""),
                  price=price, k=k, ret=None, note=f"补选自 {refill.get('since')}")
     books.clear_refill("补选成功")
-    if a.push and _push(out):
-        books.mark_pushed("refill", out["signal_date"])
+    books.mark_pushed("refill", out["signal_date"], {"action": out["action"][:60]})
+    if a.push and not _push(out):
+        return 2
     return 0
 
 
@@ -470,6 +479,12 @@ def main() -> int:
     out = compute_signal(bars, etf, mem, day)
     if a.hold:
         out["action"] = f"（指定持仓 {a.hold.upper()}）" + out["action"]
+
+    # 同一天被 Cloudflare 和 GitHub schedule 各触发一次时，这里挡住第二次记账
+    if not a.replay and kind in ("rebalance", "week", "refill") \
+            and books.already_pushed(kind, out["signal_date"]):
+        print(f"{kind} {out['signal_date']} 已处理过，跳过")
+        return 0
 
     if kind == "rebalance":
         rc = _run_rebalance(out, pos, a, bars, etf, ktab)
