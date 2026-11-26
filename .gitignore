@@ -20,3 +20,6 @@ __pycache__/
 # 密钥
 .env
 .env.*
+
+# 本地推送脚本（含历史 token，不入库）
+_push.ps1
