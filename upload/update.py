@@ -46,6 +46,14 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
       "Referer": "https://finance.sina.com.cn"}
 
 MA_WIN = {"ma20": (20, 10), "ma50": (50, 50), "ma60": (60, 30), "ma200": (200, 200)}
+
+
+def sina_sym(s: str) -> str:
+    """新浪美股代码用点号（BRK.B / BF.B），本地成分表用连字符（BRK-B / BF-B）。
+
+    不改这一步，这两只每天都会被当成抓取失败，直接从成分池里消失。
+    """
+    return str(s).replace("-", ".")
 SLOPES = {"slope20_5d": ("ma20", 5), "slope60_5d": ("ma60", 5), "slope20_10d": ("ma20", 10)}
 ADX_N, RSRS_N, RSRS_M = 14, 20, 40
 TURN_WIN = [(20, 10), (120, 60)]
@@ -224,7 +232,7 @@ def main() -> int:
     print(f"拉取 {len(syms)} 只的末段数据用于算 k ...")
     sina_last = {}
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = {ex.submit(fetch_daily, s): s for s in syms}
+        futs = {ex.submit(fetch_daily, sina_sym(s)): s for s in syms}
         for f in as_completed(futs):
             s = futs[f]
             try:
@@ -268,7 +276,7 @@ def main() -> int:
     fails = []
     done = 0
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = {ex.submit(fetch_daily, s): (p, s) for p, s in zip(permnos, syms)}
+        futs = {ex.submit(fetch_daily, sina_sym(s)): (p, s) for p, s in zip(permnos, syms)}
         for f in as_completed(futs):
             p, s = futs[f]
             done += 1
@@ -306,8 +314,19 @@ def main() -> int:
 
     # 3) 实时股本 -> 市值
     print("拉取实时股本 ...")
-    shares = fetch_shares(sorted({s for s in syms if s in set(kdf.symbol)}))
-    print(f"  成功 {len(shares)}/{len(syms)}")
+    # 快照也用点号取，取回来再按本地连字符名映射
+    raw_shares = fetch_shares(sorted({sina_sym(s) for s in syms if s in set(kdf.symbol)}))
+    shares = {s: raw_shares[sina_sym(s)] for s in syms if sina_sym(s) in raw_shares}
+    # 新浪快照对 BRK.B / BF.B 返回空，用 latest_data 末日 mcap/close 反推股本兜底
+    # （股本变动极慢，差一两周不影响市值门槛判断）
+    last_rows = bars0.sort_values("date").groupby("permno").tail(1).set_index("permno")
+    implied = (last_rows.mcap / last_rows.close).to_dict()
+    filled = 0
+    for p, s in zip(permnos, syms):
+        if s not in shares and p in implied and np.isfinite(implied[p]):
+            shares[s] = float(implied[p])
+            filled += 1
+    print(f"  成功 {len(shares)}/{len(syms)}（其中 {filled} 只用 latest_data 反推）")
     sina_all["shares"] = sina_all.symbol.map(shares)
     # close 已被 k 缩放为后复权价，除以 k 还原为新浪原始价，再乘股本得真实市值
     # 去掉 .OLD 后可能出现同名（如 SKYD 有两个 permno），去重后再做映射
