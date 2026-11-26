@@ -59,6 +59,7 @@ BEAR_TOPN = 3
 BEAR_RATIO = 0.5
 STOP_LOSS = 0.10
 STOP_REPICK_DOM = 15        # 止损后是否给补选机会的截止日（自然月），与回测 REFILL_DAY 一致
+CATCHUP_MAX_DAYS = 10       # 月末调仓漏跑后，最多回看多少天补做
 
 GATE_NAMES = [
     ("MA20>MA60", lambda r: r.ma20 > r.ma60),
@@ -133,6 +134,23 @@ def next_month_end(d: dt.date) -> dt.date:
     return d
 
 
+def _missed_rebalance(today: dt.date) -> dt.date | None:
+    """最近一个「该调仓、但账本里没有」的月末交易日。
+
+    触发被漏掉的典型场景：Cloudflare 在盘中那一刻没把 workflow 叫醒，或者当天
+    整个 Actions 挂了。月末调仓漏掉不会自愈——空仓第二天 `resolve_kind` 返回 none，
+    会一直空等到下个月末，整整丢一个月。所以第二天起主动补一次。
+
+    只回看 `CATCHUP_MAX_DAYS` 天：再早的属于上线前的历史，不该当成漏跑。
+    """
+    d = today
+    for _ in range(CATCHUP_MAX_DAYS):
+        d -= dt.timedelta(days=1)
+        if occasion_kind(d) == "rebalance" and not books.already_pushed("rebalance", str(d)):
+            return d
+    return None
+
+
 def _check(force: bool = False) -> int:
     """只判「今天该不该跑」，只读 json 账本，不读 parquet。
 
@@ -146,6 +164,10 @@ def _check(force: bool = False) -> int:
     kind = resolve_kind(today, pos, refill)
     print(f"{today} {occ.reason}" + (f"｜持仓 {pos.symbol}" if pos.symbol else "")
           + ("｜补选中" if refill.get("open") else ""))
+    missed = _missed_rebalance(today)
+    if missed is not None:
+        print(f"检测到 {missed} 的月末调仓没做过，本次一并补跑")
+        return 0
     if kind == "none":
         print("非调仓日 / 非周末最后交易日且无持仓、无补选，跳过")
         return 10
@@ -526,6 +548,25 @@ def _run_refill(out: dict, pos, refill: dict, a, bars, etf, ktab) -> int:
     return 0
 
 
+def _run_catchup(day: dt.date, a, data_dir: Path, ktab) -> int:
+    """补做漏掉的月末调仓：用那一天的历史 bar 重算，成交价就是那天的复权收盘。
+
+    这样补出来的账本和「当时正常跑了」是同一笔，不会因为延迟几天而用错价格。
+    幂等键由 _run_rebalance 写入（log 日期 = 那个月末），所以不会重复补。
+    """
+    bars, etf, mem = load(data_dir)
+    d = pd.Timestamp(day)
+    if d not in bars.date.values:
+        # 不能用「最近一天」顶替：那样记账日期会错，幂等键也写错，会天天重补
+        print(f"补跑 {day}：数据里还没有这天的行情，本次跳过（下次触发再试）")
+        return 0
+    out = compute_signal(bars, etf, mem, d)
+    out["kind"] = "rebalance"
+    out["action"] = f"（补跑 {day:%Y-%m-%d} 的月末调仓）{out['action']}"
+    print(f"补跑 {day} 的月末调仓｜数据日 {d.date()}｜{out['regime']}｜{out['action']}")
+    return _run_rebalance(out, books.load_position(), a, bars, etf, ktab)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=None, help="信号日，默认取最新交易日")
@@ -558,6 +599,22 @@ def main() -> int:
     today = dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(cal.ET).date()
     kind = a.kind if a.kind != "auto" else (
         occasion_kind(today) if a.replay else resolve_kind(today, pos, refill))
+
+    # 月末调仓漏跑（触发没叫醒 / Actions 整体挂了）：先把那一期补做掉，再做今天的动作。
+    # 补跑用那个月末的历史收盘价，不会因为晚几天而买在错的价位。
+    if a.kind == "auto" and not a.replay:
+        missed = _missed_rebalance(today)
+        if missed is not None:
+            rc = _run_catchup(missed, a, data_dir, ktab)
+            if rc:
+                return rc
+            pos, refill = books.load_position(), books.load_refill()
+            kind = resolve_kind(today, pos, refill)
+            # 补跑用的是历史收盘价，任何时刻都能做；但今天的动作仍要守在窗口内
+            if not a.force and not cal.in_window(dt.datetime.now(cal.UTC),
+                                                 cal.occasion_for(today), 5, 40):
+                print("补跑完成；现在不在收盘前窗口内，今天的动作到此为止")
+                return 0
 
     if kind == "stop":
         return _run_stop(pos, a, data_dir, ktab)
