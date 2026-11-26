@@ -347,8 +347,65 @@ def _run_week(out: dict, pos, a) -> int:
     return 0
 
 
-def _run_stop(pos, a, data_dir: Path, ktab) -> int:
-    """收盘前止损检查：只取持仓票一个实时价，不跑全池。ETF 不参与（与回测一致）。"""
+def _today(a) -> dt.date:
+    return dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(cal.ET).date()
+
+
+def _prepare(a, data_dir: Path, ktab):
+    """备好当日行情：优先用 15:30 实时报价合成当日 bar，否则退回数据最新日。
+
+    返回 (bars, etf, mem, day, notes)；日期早于数据起点时返回 None。
+    """
+    bars, etf, mem = load(data_dir)
+    notes: list[str] = []
+    day = None
+    if not a.replay:
+        snap = live_bar.build(bars, etf, mem, ktab, _today(a))
+        if snap is not None:
+            bars, etf, mem, live_day, notes = snap
+            day = pd.Timestamp(live_day)
+            print(f"口径：实时合成 {live_day} 当日 bar"
+                  f"（{len(bars)} 只个股 / {len(etf)} 个 ETF）")
+        else:
+            print("未合成当日 bar（非交易日 / 日线已入库 / 报价不足），退回数据最新日")
+    if day is None:
+        all_dates = sorted(bars.date.unique())
+        day = pd.Timestamp(a.date) if a.date else pd.Timestamp(all_dates[-1])
+        if day not in bars.date.values:
+            near = [d for d in all_dates if d <= day]
+            if not near:
+                print(f"日期 {day.date()} 早于数据起点")
+                return None
+            day = pd.Timestamp(near[-1])
+    return bars, etf, mem, day, notes
+
+
+def _decide_pick(out: dict, bull_now: bool, exclude: str = ""):
+    """按牛熊挑一个标的，止损重选和补选共用这一处。
+
+    熊市走 ETF 通道（交集为空则空仓），牛市从候选池取第一只过闸的个股，
+    两种情况都不能买回 exclude 指定的那只。
+    """
+    exclude = (exclude or "").upper()
+    if bull_now:
+        for c in out.get("candidates") or []:
+            if c.get("pass") and c["symbol"].upper() != exclude:
+                return {"kind": "stock", "symbol": c["symbol"], "sector": c["sector"],
+                        "close": c["close"], "reason": f"重选（排除 {exclude or '无'}）"}
+        return None
+    pick = out.get("pick")
+    if pick and pick["symbol"].upper() == exclude:
+        return None
+    return pick
+
+
+def _run_stop(pos, a, data_dir: Path, ktab, allow_pick: bool = True) -> int:
+    """收盘前止损检查：只取持仓票一个实时价，不跑全池。ETF 不参与（与回测一致）。
+
+    触发后按回测口径当场重选一次（15 号前）：先用当天的 bear_ratio21 判牛熊，
+    熊市买板块 ETF、牛市买个股；买不进才开补选窗口逐日重挑。
+    allow_pick=False 用于调仓日/周报日——那天紧接着就要按日历决策，不必先买一手。
+    """
     if pos.is_empty():
         print("无持仓，跳过止损检查")
         return 0
@@ -371,7 +428,7 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
         print(f"未触及 -{STOP_LOSS:.0%}，继续持有")
         return 0
 
-    today = dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(cal.ET).date()
+    today = _today(a)
     if not a.replay and books.already_pushed("stop", str(today)):
         print(f"{today} 已做过止损检查，跳过")
         return 0
@@ -379,24 +436,49 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
     action = f"止损卖出 {sold}（{ret_s}）"
     # 只有 15 号之前止损才给补选机会；15 号及以后直接空仓到下一个调仓日
     allow = today.day < STOP_REPICK_DOM
-    print(f"{action}｜{'次一交易日起逐日重判牛熊' if allow else '本月不再补选，空仓到调仓日'}")
+    print(f"{action}｜{'当天按牛熊重选一次' if allow else '本月不再补选，空仓到调仓日'}")
 
     if a.replay:
         return 0
 
     books.record_stop(pos, day=str(today), action=action, price=q, ret=ret,
                       note="止损", retry_used=pos.stop_retry)
-    if allow:
-        # origin=stop 的窗口在 _run_refill 里用当天的 bear_ratio21，每天重判
+
+    # 当天就把流程走完：先判当天牛熊，再决定买 ETF 还是个股（与回测同序）
+    target = ""
+    if allow and allow_pick:
+        got = _prepare(a, data_dir, ktab)
+        if got is not None:
+            bars2, etf2, mem2, day2, _ = got
+            sig = compute_signal(bars2, etf2, mem2, day2)
+            pick = _decide_pick(sig, not sig["is_bear"], sold)
+            if pick:
+                price2 = _close_of(pick["symbol"], day2, bars2, etf2) or 0.0
+                k2 = 1.0 if pick["kind"] == "etf" else ktab.get(pick["symbol"].upper(), 1.0)
+                books.record(pos, day=str(today), kind="refill", action="建仓",
+                             target=pick["symbol"], target_kind=pick["kind"],
+                             sector=pick.get("sector", ""), price=price2, k=k2,
+                             ret=None, note=f"止损当天重选（排除 {sold}）")
+                target = pick["symbol"]
+                print(f"当天重选：{sig['regime']} → 买入 {target}（{pick.get('sector', '')}）")
+            else:
+                print(f"当天重选：{sig['regime']} → 无合格标的")
+
+    if allow and not target:
+        # 当天没买进 -> 开窗口，次一交易日起每天按当天 bear_ratio21 重判
         books.set_refill(since=str(today), until=str(next_month_end(today)),
                          bull=True, exclude=sold, origin="stop")
 
     out = {"signal_date": str(today), "kind": "stop", "regime": "-",
            "spy_bear_ratio21": None, "sector_rank": [], "candidates": [],
-           "action": action,
+           "action": action + (f" → 当天买入 {target}" if target else ""),
            "position_line": f"**已清仓**：{sold}｜持有期 {ret_s}｜卖出价 {q:.2f}"}
-    tail = (f"补选：次一交易日起逐日重判牛熊（先排除 {sold}）" if allow
-            else "本月不再补选，空仓到下一个调仓日")
+    if target:
+        tail = f"止损后当天重选：买入 {target}"
+    elif allow:
+        tail = f"补选：当天无合格标的，次一交易日起逐日重判牛熊（先排除 {sold}）"
+    else:
+        tail = "本月不再补选，空仓到下一个调仓日"
     books.mark_pushed("stop", str(today), {"action": action[:60]})
     if a.push and not _push(out, [tail]):
         return 2
@@ -417,16 +499,9 @@ def _run_refill(out: dict, pos, refill: dict, a, bars, etf, ktab) -> int:
     else:
         bull_now = bool(refill.get("bull", True))
 
-    if bull_now:
-        cands = [c for c in out["candidates"] if c["pass"] and c["symbol"].upper() != exclude]
-        pick = cands[0] if cands else None
-        if pick:
-            out["pick"] = {"kind": "stock", "symbol": pick["symbol"], "sector": pick["sector"],
-                           "close": pick["close"], "reason": f"补选（排除 {exclude or '无'}）"}
-    else:
-        # 熊市补选窗口：沿用 ETF 通道
-        if out["pick"] and out["pick"]["symbol"].upper() == exclude:
-            out["pick"] = None
+    # 统一走 _decide_pick：牛市取第一只过闸且不是刚割的那只，熊市走 ETF 通道。
+    # 这里必须整体覆盖 out["pick"]，否则「唯一过闸的就是刚止损那只」时会被买回去。
+    out["pick"] = _decide_pick(out, bull_now, exclude)
 
     target = out["pick"]["symbol"] if out["pick"] else ""
     if not target:
@@ -490,35 +565,16 @@ def main() -> int:
     # 调仓日 / 周报日如果还持有股票，先做一次止损检查（与回测「先查止损再调仓」同序）；
     # 被割掉就清了仓，下面的调仓照常进行。
     if not a.replay and not pos.is_empty() and pos.kind == "stock":
-        rc = _run_stop(pos, a, data_dir, ktab)
+        # 这天紧接着要按日历调仓/发周报，先只做止损检查，不先买一手
+        rc = _run_stop(pos, a, data_dir, ktab, allow_pick=False)
         if rc:
             return rc
         pos = books.load_position()
 
-    bars, etf, mem = load(data_dir)
-    notes: list[str] = []
-    day = None
-
-    # 实盘：用 15:30 的实时报价补一根当日 bar（表里最新一行还是昨天）
-    if not a.replay:
-        snap = live_bar.build(bars, etf, mem, ktab, today)
-        if snap is not None:
-            bars, etf, mem, live_day, notes = snap
-            day = pd.Timestamp(live_day)
-            print(f"口径：实时合成 {live_day} 当日 bar"
-                  f"（{len(bars)} 只个股 / {len(etf)} 个 ETF）")
-        else:
-            print("未合成当日 bar（非交易日 / 日线已入库 / 报价不足），退回数据最新日")
-
-    if day is None:
-        all_dates = sorted(bars.date.unique())
-        day = pd.Timestamp(a.date) if a.date else pd.Timestamp(all_dates[-1])
-        if day not in bars.date.values:
-            near = [d for d in all_dates if d <= day]
-            if not near:
-                print(f"日期 {day.date()} 早于数据起点")
-                return 1
-            day = pd.Timestamp(near[-1])
+    got = _prepare(a, data_dir, ktab)
+    if got is None:
+        return 1
+    bars, etf, mem, day, notes = got
 
     out = compute_signal(bars, etf, mem, day)
     out["notes"] = notes
