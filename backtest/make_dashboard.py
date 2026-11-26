@@ -282,10 +282,11 @@ const openSet = new Map();      // i -> {tr, box, canvas}
 /* ---------------- 通用绘图 ---------------- */
 function setup(cv, cssH){
   const dpr = window.devicePixelRatio || 1;
-  const w = cv.parentElement.clientWidth - 34;      // 去掉 .expbox 左右内边距
+  // 用画布自身的 CSS 宽度，位图与显示 1:1，箭头和鼠标位置才不会偏
+  const w = cv.clientWidth;
   if (w <= 0) return null;
   cv.style.height = cssH + 'px';
-  cv.width = w * dpr; cv.height = cssH * dpr;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(cssH * dpr);
   const ctx = cv.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, cssH);
@@ -393,7 +394,7 @@ function drawK(cv, p){
   const vis = rows;
   const lo = Math.min(...vis.map(r => r[3]));
   const hi = Math.max(...vis.map(r => r[2]));
-  const pad = (hi - lo) * 0.06 || 1;
+  const pad = (hi - lo) * 0.09 || 1;   // 留出画箭头的空隙
   const {px, py} = axes(ctx, w, h, lo - pad, hi + pad,
                         rows.map(r => r[0]), padL, padR, padT, padB, false);
 
@@ -426,18 +427,26 @@ function drawK(cv, p){
   drawMA(m20, '#e3b341');
   drawMA(m60, '#a371f7');
 
-  const mark = (idx, price, up) => {
+  // 箭头画在 K 线外侧：买入在最低价下方尖端朝上，卖出在最高价上方尖端朝下，
+  // 这样一眼就能看出它属于哪一根，不会和当天实体糊在一起。
+  const mark = (idx, up) => {
     if (idx === null || idx === undefined || idx < from || idx >= all.length) return;
-    const i = idx - from, x = px(i), y = py(price), s = 7;
+    const bar = all[idx];
+    const x = px(idx - from), s = 6;
     ctx.beginPath();
-    if (up){ ctx.moveTo(x, y - s - 2); ctx.lineTo(x - s, y + s); ctx.lineTo(x + s, y + s); }
-    else   { ctx.moveTo(x, y + s + 2); ctx.lineTo(x - s, y - s); ctx.lineTo(x + s, y - s); }
+    if (up){
+      const y0 = py(bar[3]) + 5;
+      ctx.moveTo(x, y0); ctx.lineTo(x - s, y0 + s + 2); ctx.lineTo(x + s, y0 + s + 2);
+    } else {
+      const y0 = py(bar[2]) - 5;
+      ctx.moveTo(x, y0); ctx.lineTo(x - s, y0 - s - 2); ctx.lineTo(x + s, y0 - s - 2);
+    }
     ctx.closePath();
     ctx.fillStyle = up ? '#f0883e' : '#4493f8'; ctx.fill();
     ctx.strokeStyle = '#0d1117'; ctx.lineWidth = 1.5; ctx.stroke();
   };
-  mark(p.buy_i, p.buy_px, true);
-  mark(p.sell_i, p.sell_px, false);
+  mark(p.buy_i, true);
+  mark(p.sell_i, false);
 
   cv._hit = {px, py, n, all, from, p};
 }

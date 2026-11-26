@@ -287,7 +287,10 @@ def run(cfg: Cfg, dump: bool = False):
                 cur = None
                 # 11 号前补买一次（不同票）
                 if d.day < REFILL_DAY:
-                    got3 = eng.pick_stock(cands, dt, exclude=lost)
+                    # 必须用当天 d 的候选与报价：用 cands/dt 会把调仓日的收盘价
+                    # 当成当天的买入价，Buy 记录的日期与价格对不上（差出好几天）。
+                    c3 = eng.stock_candidates(d)
+                    got3 = eng.pick_stock(c3, d, exclude=lost)
                     if got3:
                         sec3, q3, qpx3 = got3
                         if pd.notna(qpx3) and qpx3 > 0:
