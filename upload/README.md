@@ -85,18 +85,27 @@ python upload/update.py --verify       # 只算 k 并抽样，不写盘
 python upload/update.py                # 全量
 ```
 
-## 已知限制（待完善）
+## 三个脚本都是增量的
+
+| 脚本 | 做什么 |
+|---|---|
+| `update_members.py` | 抓 S&P 500 名单；老票沿用 permno，新票从 `1_000_001` 起分配并写 `permno_map.csv` |
+| `update.py` | 按 permno_map 拉日线与股本，接 `latest_data` 的复权尺度算 `k`，重算全部指标 |
+| `update_etf.py` | 12 个 ETF 日线与 RSRS；合并后统一重算 raw/z，保证两列同源 |
+
+一键执行（顺序不能乱）：`python upload/update_all.py`
+
+## 已知限制
 
 | # | 问题 | 现状 |
 |---|---|---|
-| 1 | **成分股变动** | 目前沿用 `latest_data` 的 members，未接入 Wikipedia 增量 |
-| 2 | **新调入票** | 尚未分配合成 permno（`permno_map.csv` 未实现） |
-| 3 | **ETF 与 SPY** | 目前直接裁剪 `latest_data`，未从新浪增量拉取 |
-| 4 | **拆股处理** | k 跳变未自动检测，需人工重算该票 |
-| 5 | **失败票** | 记录在控制台输出，未落盘重试队列 |
+| 1 | 失败票 | 只打印到控制台，未落盘重试；实际每天 0~2 只 |
+| 2 | 新浪代码写法 | 连字符要转点号（`BRK-B` → `BRK.B`），`sina_sym()` 已处理 |
+| 3 | 股本缺失 | `BRK.B` / `BF.B` 快照为空，用 `latest_data` 末日 `mcap/close` 反推 |
+| 4 | ETF 斜率 | `slope120_weighted` 新增段是对数回归近似，重叠区沿用原值 |
 
 ## 与实盘的衔接
 
-`live/signal.py` 需要在启动时读 `upload/` 而不是 `latest_data/`。
+`live/signal.py` 读 `upload/`；`backtest/` 读 `latest_data/`。
 
 计划给 `signal.py` 加 `--data-dir` 参数，默认 `latest_data`，实盘传 `upload`。

@@ -1,16 +1,11 @@
-# 行情与日志都在独立的 data 分支，不进主仓
-data/
+# 运行产物
 logs/
-state/
-# 实盘账本（持仓/补选/幂等键）要进主仓，不能跟着旧的 state/ 一起被忽略
+reports/
+backtest/output/
+
+# 实盘账本必须入库（持仓/补选/幂等键），不要在这里忽略
 !live/state/
 !live/state/**
-
-# 回测产物一律不入库，只跟踪网页看板（单文件 HTML，离线可看）
-reports/*
-!reports/web/
-reports/web/*
-!reports/web/*.html
 
 .venv/
 __pycache__/
@@ -24,5 +19,6 @@ __pycache__/
 .env
 .env.*
 
-# 本地推送脚本（含历史 token，不入库）
+# 本地临时脚本
 _push.ps1
+_*.log

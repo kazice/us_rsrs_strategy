@@ -1,78 +1,83 @@
-# 实盘信号
+# 实盘
 
-脚本：`live/signal.py`　数据：`latest_data/`（唯一数据源）
+数据读 `upload/`（每日收盘后更新），口径与 `backtest/` 一致，区别见文末。
 
-与 `backtest/backtest_benchmark.py` **同一套口径**，只是把回测循环换成"算当期信号"。
-
-## 运行
-
-```powershell
-python live/signal.py                 # 用数据里最新交易日
-python live/signal.py --date 2026-11-13
-python live/signal.py --hold CL       # 带上当前持仓，输出换仓指令
-python live/signal.py --json          # 机器可读
-```
-
-## 输出内容
-
-1. **牛熊状态**：SPY 收盘低于 MA200 的占比（>50% 判熊）
-2. **板块 RSRS 排名**：10 个板块 ETF 的 `rsrs20_40_z`，标注前 3
-3. **候选池**：牛市时 9 只（3 板块 × 3 只），逐只显示是否通过 6 条趋势闸及卡在哪条
-4. **最终指令**：买哪只 / 空仓 / 继续持有
-
-## 口径（与 backtest 完全一致）
-
-| 项 | 规则 |
-|---|---|
-| 调仓时点 | 每月最后一个交易日，**当天收盘**先卖后买 |
-| 板块池 | 10 个 SPDR ETF，不含 XLRE |
-| 板块层 | RSRS 取前 3 |
-| 个股层 | 每板块 `turn20²/turn120` 取前 3 |
-| 硬门槛 | `turn20 ≤ 20%`、`turn120` 有效、`mcap > 500 亿美元` |
-| 趋势闸 | MA20>MA60、MA20 的 10 日斜率>0、MA60 的 5 日斜率>0、close>MA50、MA50>MA200、ADX>10（全 AND） |
-| 熊市 | 买 ETF（RSRS 前3 ∩ 斜率前3），交集为空则空仓，**不补选** |
-| 牛市空仓 | 次一交易日起**逐日补选** |
-| 止损 | 个股 −10%，11 号前可补买 1 次（不同票） |
-
-## 与回测的唯一差异：换手率折算
-
-| 场景 | 当日 `turnover` 权重 |
-|---|---|
-| **回测** | **1.0**（当日数据完整） |
-| **实盘** | **0.48**（收盘前下单，当日成交额未走完） |
-
-实盘若在收盘后运行，当日数据已完整，可按 1.0 使用；若在盘中预估，需按 0.48 折算。
-当前脚本读的是 `latest_data` 里的已结算数据，等于 1.0。
-
-## 示例输出（2026-11-13）
+## 触发时序
 
 ```
-信号日: 2026-11-13   状态: 牛市  (SPY 跌破MA200占比 0.0)
-
-板块 RSRS 排名:
-   1. XLP   rsrs_z= 1.0009  slope120=0.0008 ←入选
-   2. XLF   rsrs_z= 0.6907  slope120=0.0002 ←入选
-   3. XLC   rsrs_z= 0.6186  slope120=-0.0004 ←入选
-   ...
-
-候选池 9 只:
-  XLP  TGT     close=  165.90 turn20=0.0080 mcap=  733.5亿USD adx=20.52  FAIL MA20>MA60
-  XLP  CL      close=  102.06 turn20=0.0060 mcap=  792.3亿USD adx=39.37  PASS
-  XLF  AJG     close=  285.51 turn20=0.0072 mcap=  725.5亿USD adx=34.86  PASS
-  ...
-
->>> 买入 CL（XLP）
-    依据: 9只候选池中第一只通过趋势闸
+Cloudflare Worker（一次性日期 cron）
+  ├─ 收盘 −30min  → paper_trade.yml → signal job
+  └─ 收盘 +30min  → paper_trade.yml → data job → upload/update_all.py
+                        ↓ 跑完
+                   next-trigger → cron_sync.py sync → 写回 Cloudflare 的下一次 cron
 ```
 
-## 数据依赖
+工作日还有一条 GitHub 自带 schedule 兜底。两个 job 都先跑闸门，不在窗口内直接
+`exit 0`，**不推送、不回写**。
 
-`latest_data/` 下的三个文件，全部为已修复版本：
+## 四种动作
+
+`--kind auto` 按「账本 + 日历」判断，不需要额外的定时器：
+
+| kind | 什么时候 | 做什么 | 推送 |
+|---|---|---|---|
+| `rebalance` | 月末最后交易日 | 换仓、记账；牛市空仓则开补选窗口 | 是 |
+| `week` | 周内最后交易日 | 只出周报，不动持仓 | 是 |
+| `stop` | **每个交易日**收盘前 | 持仓票跌破 −10% 割掉，11 号前可重选 | 仅触发时 |
+| `refill` | 空仓 / 止损后逐日 | 重挑标的，命中即建仓 | 仅建仓时 |
+
+判定顺序：有持仓 → `stop`；补选窗口内 → `refill`；否则看日历。
+
+## 当日 bar 怎么来
+
+`upload/bars_daily.parquet` 是收盘后才更新的，15:30 决策时最新一行还是昨天。
+回测的信号日 d 用的是 d 的收盘价，直接读表等于整体提前一天，所以 `live_bar.py`
+用实时报价补一根当日 bar：
+
+```
+close = 现价 × k      high = 盘中最高 × k      low = 盘中最低 × k
+amount = 累计成交量 × 现价 ÷ 0.48      （还原成全天口径）
+```
+
+三道校验不过就退回「数据最新日」并在推送里说明：非交易日、当日日线已入库、
+报价日期不是今天、或带真实 high/low 的报价不足一半（开盘前会退化成一点）。
+
+## 账本
+
+`live/state/` 随代码一起提交，跨天靠它记住三件事：
 
 | 文件 | 内容 |
 |---|---|
-| `bars_daily.parquet` | 个股日频：行情、`turn20/turn120/turn_score`、`mcap`、均线、`adx14` |
-| `etf_daily.parquet` | 板块 ETF 与 SPY：`rsrs20_40_z`、`slope120_weighted`、`bear_ratio21` |
-| `members_daily.parquet` | 逐日成分股与板块归属 |
+| `positions.json` | 当前持仓、建仓日、建仓复权价、`entry_k`、净值、本月是否已止损重选 |
+| `refill.json` | 补选窗口 `{open, since, until, bull, exclude, origin}` |
+| `pushed.json` | 按 kind 分开的幂等键，同一天重复触发不会重复记账 |
+| `ledger.csv` | 流水：日期、动作、换出/换入、价格、持有期收益、净值 |
 
-**注意**：`data/` 目录已删除，`latest_data/` 是唯一数据源，不再有重建流程。
+`TA_STATE_DIR` 可以把账本指到别处（测试用）。
+
+## 命令
+
+```powershell
+python live/signal.py --check                 # 只判今天该不该跑（只读账本）
+python live/signal.py --kind auto --push      # 正常一轮
+python live/signal.py --date 2026-11-25       # 复盘：只算不记账、不推送
+python live/signal.py --kind stop --today 2026-12-03   # 强制某天做止损检查
+```
+
+`--check` 的退出码：`0` = 该跑，`10` = 跳过（workflow 用 `== '10'` 判定，不当失败）。
+
+## 与回测的三处差异
+
+| 项 | 回测 | 实盘 |
+|---|---|---|
+| 当日换手率权重 | 1.0 | 0.48（收盘前成交额未走完） |
+| 盘中 high/low | 全天振幅 | 15:30 之前的振幅，略窄 |
+| 成交价 | 信号日收盘价 | 15:30 价格，最后 30 分钟波动相当于滑点 |
+
+三条都会写进推送正文的「口径」一节，不做隐藏。
+
+## 参数
+
+都在 `signal.py` 顶部：`ADX_MIN=10`、`MCAP_MIN=500e8`、`TURN_CAP=0.20`、
+`TOPN_SECTOR=3`、`TOPN_STOCK=3`、`BEAR_RATIO=0.5`、`STOP_LOSS=0.10`、
+`STOP_REPICK_DOM=11`，与回测默认值一一对应。

@@ -4,25 +4,30 @@
 牛市在板块内按 `turn20²/turn120` 取前 3 只，3 板块共 9 只候选，再过 6 条趋势闸；
 熊市不碰个股，只买「RSRS 前 3 ∩ 120 日加权斜率前 3」交集里最强的板块 ETF。
 
-**每月最后一个交易日收盘**决策：先卖出持仓，再买入新标的。
+**每月最后一个交易日收盘前 30 分钟**决策：先卖出持仓，再买入新标的。
 
 ## 目录
 
 ```
-latest_data/     唯一数据源（3 个 parquet）
-backtest/        回测脚本与口径文档
-live/            实盘信号生成
-config/          配置
-logs/            运行日志
+latest_data/     只读基板（回测用，不参与每日更新）
+upload/          实盘数据（每日收盘后更新，commit 到 main）
+live/            实盘信号、账本、日历、推送
+backtest/        回测脚本与口径
+.github/         Actions：paper_trade.yml / cron_check.yml
 ```
 
-`data/`、`scripts/`、`src/`、`tests/`、`docs/`、`reports/` 已全部移除，数据只保留 `latest_data/`。
+实盘只读 `upload/`，回测只读 `latest_data/`。两者口径相同，区别只在数据区间：
+
+| 目录 | 区间 | 谁用 |
+|---|---|---|
+| `latest_data/` | 2021-01 ~ 2026-11-13 | 回测基线 |
+| `upload/` | 2025-12-31 ~ 至今，每日推进 | 实盘 |
 
 ## 策略口径
 
 ### 标的池
 - **板块**：10 个 SPDR 行业 ETF
-- **个股**：`members_daily.parquet` 中当日归属该板块的 S&P 500 成员（逐日 permno，2026 年每日约 503 只）
+- **个股**：`members_daily.parquet` 中当日归属该板块的 S&P 500 成员（逐日 permno，约 503 只）
 
 ### 硬门槛
 | 条件 | 阈值 |
@@ -56,10 +61,10 @@ logs/            运行日志
 ### 交易规则
 | 项 | 规则 |
 |---|---|
-| 调仓时点 | 每月最后一个交易日，**当天收盘**先卖后买 |
+| 调仓时点 | 每月最后一个交易日，收盘前 30 分钟 |
 | 持仓 | 1 个标的，100% 全仓 |
 | 同票续持 | 不重复收费 |
-| 止损 | 个股相对买入价 **−10%**；止损日在每月 **11 号前**可补买 1 次（不得同一只） |
+| 止损 | 个股相对买入价 **−10%**；止损日在每月 **11 号前**可补选 1 次（不得同一只） |
 | 牛市空仓 | 次一交易日起**逐日补选**，直到选出或到下一调仓日 |
 | 成本 | 单边 5bp，滑点未建模 |
 
@@ -67,38 +72,52 @@ logs/            运行日志
 | 场景 | 当日 `turnover` 权重 |
 |---|---|
 | 回测 | **1.0** |
-| 实盘（收盘前下单） | **0.48** |
+| 实盘（收盘前 30 分钟） | **0.48**（当日成交额只走完约一半） |
 
-## 使用
+## 实盘运行
+
+由 Cloudflare Worker 在收盘前 30 分钟 / 收盘后 30 分钟各触发一次
+`workflow_dispatch`，`paper_trade.yml` 内部按日历判断该不该动，不动就直接退出、不提交。
 
 ```powershell
-# 回测
-python backtest/backtest_benchmark.py --tag v1
+# 本地复盘（不写账本）
+python live/signal.py --date 2026-11-25 --kind rebalance
 
-# 实盘信号
-python live/signal.py
-python live/signal.py --hold CL --date 2026-11-13
+# 手动完整跑一轮（需要 PUSHPLUS_TOKEN）
+python live/signal.py --kind auto --push
+
+# 数据更新
+python upload/update_all.py
 ```
 
-产出：`reports/bt_v2/bt_<tag>/`（`nav_daily.csv`、`hold_daily.csv`、`holds.csv`、`stats.csv`）
+四种动作、账本结构、当日 bar 合成方式见 `live/README.md`。
 
-## 回测结果（2021-12-31 ~ 2026-10-26）
+## 回测结果（2022-01-03 ~ 2026-11-13，`latest_data`）
 
 | 指标 | 策略 | SPY |
 |---|---|---|
-| 累计收益 | **1517.24%** | 70.70% |
-| 年化 | **78.35%** | 11.76% |
-| 年化波动 | 36.09% | 17.25% |
-| 夏普 | **2.1710** | 0.6816 |
-| 最大回撤 | **−39.69%** | −24.50% |
-| 交易 | 51 笔 / 止损 4 次 / 胜率 70.6% | — |
+| 累计收益 | **1363.47%** | 68.25% |
+| 年化 | **73.70%** | 11.30% |
+| 年化波动 | 35.67% | 17.36% |
+| 夏普 | **2.0663** | 0.6511 |
+| 最大回撤 | **−39.88%** | −24.50% |
+| 交易 | 54 笔 / 止损 4 次 / 胜率 68.5% | — |
+| 空仓天数占比 | 13.6% | — |
+
+```powershell
+python backtest/backtest_benchmark.py --tag v1
+```
+
+产出：`reports/bt_v2/bt_<tag>/`（`nav_daily.csv`、`hold_daily.csv`、`holds.csv`、`stats.csv`）。
 
 ## 数据说明
 
 | 文件 | 内容 |
 |---|---|
-| `latest_data/bars_daily.parquet` | 个股日频：行情、`turn20/turn120/turn_score`、`mcap`、均线、`adx14`、RSRS |
-| `latest_data/etf_daily.parquet` | 板块 ETF 与 SPY：`rsrs20_40_z`、`slope120_weighted`、`bear_ratio21` |
-| `latest_data/members_daily.parquet` | 逐日成分股与板块归属 |
+| `*/bars_daily.parquet` | 个股日频：行情、`turn20/turn120/turn_score`、`mcap`、均线、`adx14` |
+| `*/etf_daily.parquet` | 板块 ETF 与 SPY：`rsrs20_40_raw/z`、`slope120_weighted`、`bear_ratio21` |
+| `*/members_daily.parquet` | 逐日成分股与板块归属 |
+| `upload/adjust_k.csv` | 未复权价 × k = 复权口径，止损用它折算实时价 |
+| `upload/permno_map.csv` | symbol → permno 映射，新纳入的票从 `1_000_001` 起分配 |
 
-**`latest_data/` 不可再生**（构建流程已随 `data/`、`scripts/` 一并移除），请自行做好备份。
+`latest_data/` 是不可再生的基板（构建流程已随旧结构移除），只读，请自行备份。
