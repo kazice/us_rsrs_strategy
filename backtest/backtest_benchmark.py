@@ -77,6 +77,8 @@ class Cfg:
     end: str | None = None
     cost: float = 0.0005
     data_dir: str | Path = DEFAULT_DATA
+    # 变体开关：止损当天重新判定 regime（默认关闭，保持基线口径）
+    bear_on_stop: bool = False
 
 
 def load_data(data_dir):
@@ -286,6 +288,20 @@ def run(cfg: Cfg, dump: bool = False):
                 cur = None
                 # 11 号前补买一次（不同票）
                 if d.day < REFILL_DAY:
+                    # 变体：此时离调仓日已过几个交易日，重新用当天 SPY 的
+                    # bear_ratio21 判定 regime。是熊市就买板块 ETF（选不出就空仓），
+                    # 不再往个股里扎。默认关闭，基线口径仍是调仓日的旗标。
+                    if cfg.bear_on_stop and eng.bear(d):
+                        # 一旦判定为熊市，本周期余下时间都按熊市处理：
+                        # 否则第二天「空仓逐日补选」会把个股又买回来。
+                        is_bear = True
+                        got_e = eng.pick_bear_etf(d)
+                        if got_e:
+                            sym_e, px_e = got_e
+                            capital *= 1 - cfg.cost
+                            cur = dict(key=sym_e, kind="etf", shares=capital / px_e,
+                                       buy_px=px_e, buy_dt=d, sector=sym_e, name=sym_e)
+                        continue
                     # 必须用当天 d 的候选与报价：用 cands/dt 会把调仓日的收盘价
                     # 当成当天的买入价，Buy 记录的日期与价格对不上（差出好几天）。
                     c3 = eng.stock_candidates(d)
@@ -329,11 +345,14 @@ def main() -> int:
                     help="baseline = 正式基线（落 reports/baseline）；其它名字 = 参数试验，"
                          "按时间戳落 logs/<时间戳>_<tag>/")
     ap.add_argument("--dump-candidates", action="store_true")
+    ap.add_argument("--bear-on-stop", action="store_true",
+                    help="变体：止损当天用 SPY 重新判定熊市，是熊市就买板块 ETF（不买个股）")
     a = ap.parse_args()
 
     data_dir = Path(a.data_dir)
 
-    nav, trades, cands = run(Cfg(a.start, a.end, a.cost, data_dir), a.dump_candidates)
+    nav, trades, cands = run(Cfg(a.start, a.end, a.cost, data_dir, a.bear_on_stop),
+                             a.dump_candidates)
     if not len(nav):
         print("no nav")
         return 1
@@ -364,6 +383,7 @@ def main() -> int:
         "start": str(nav.index.min().date()),
         "end": str(nav.index.max().date()),
         "cost": a.cost,
+        "variants": {"bear_on_stop": bool(a.bear_on_stop)},
         "strategy": {k: globals().get(k) for k in PARAM_KEYS},
         "summary": {
             "trades": int(len(trades)),
