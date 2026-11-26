@@ -1,8 +1,10 @@
 # 行情与日志都在独立的 data 分支，不进主仓
-# 注意前导斜杠：写成 `data/` 会连 `src/quant/data/` 一起忽略，新模块会静默漏提交
-/data/
-/logs/
-/state/
+data/
+logs/
+state/
+# 实盘账本（持仓/补选/幂等键）要进主仓，不能跟着旧的 state/ 一起被忽略
+!live/state/
+!live/state/**
 
 # 回测产物一律不入库，只跟踪网页看板（单文件 HTML，离线可看）
 reports/*
@@ -21,3 +23,6 @@ __pycache__/
 # 密钥
 .env
 .env.*
+
+# 本地推送脚本（含历史 token，不入库）
+_push.ps1

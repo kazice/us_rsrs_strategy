@@ -1,270 +1,193 @@
 name: paper-trade
 
-# 两个 job 都靠「日内时钟 + 当日收盘时间」自己判断该不该干活，cron 只是唤醒器：
-#   · 收盘时间随夏令时（16:00 ET = 20:00Z 夏 / 21:00Z 冬）与早收日（13:00 ET）变化，
-#     写死一个 UTC 时间必然一年错两次；
-#   · GitHub Actions 的 schedule 本身会漂 5~30 分钟。
-# 因此每个时段都挂一条 cron，真正的判定在 python 里（quant.live.calendar），
-# 不在窗口内就直接 exit 0，不推送、不写库。
+# 触发：Cloudflare Worker 的每日一次性 cron 调 workflow_dispatch（准点）；
+# 下面那条 schedule 只做兜底，GitHub 自身会延迟数小时，不能当主力。
 #
-# 日志：run log 只留 90 天且不可查询，所以真正的证据是 data 分支里的
-# state/live/（运行流水 + 决策快照）。见 docs/LIVE_LOG.md。
-# 因此「回写」这一步用 if: always()——失败/中止的运行也必须留痕。
+# 不空跑：两个 job 都先跑闸门，不在窗口内直接 exit 0，既不推送也不回写。
 
 on:
-  schedule:
-    # 收盘前 30 分钟：16:30Z(=12:30ET 夏早收) / 17:30Z / 19:30Z / 20:30Z
-    - cron: '30 16 * * 1-5'
-    - cron: '30 17 * * 1-5'
-    - cron: '30 19 * * 1-5'
-    - cron: '30 20 * * 1-5'
-    # 收盘后：21:30Z = 16:30 ET。冬季收盘 21:00Z，data job 要求 >= 21:08Z，
-    # 只靠上面四条（最晚 20:30Z）在冬令时永远过不了闸门。
-    - cron: '30 21 * * 1-5'
   workflow_dispatch:
     inputs:
-      kind:
-        description: '强制推送类型（auto=按日历与补选窗口判断）'
-        type: choice
-        options: [auto, rebalance, week, refill, stop]
-        default: auto
-      now:
-        description: '复现时刻（如 2026-11-13 15:30，缺省时区按 ET；留空=系统时钟）'
+      date:
+        description: '复现用信号日 YYYY-MM-DD（留空 = 数据最新日）'
         default: ''
       force:
-        description: '无视执行窗口与幂等键（仅排错/验证用，会真的推送）'
+        description: '无视窗口与日历判定（仅排错用，会真的推送）'
         type: choice
         options: ['false', 'true']
         default: 'false'
       dry_run:
-        description: '只算不推（true/false）'
-        default: 'false'
-      data_now:
-        description: 'data job 的复现时刻（UTC，如 2026-11-13 21:10；留空=系统时钟）'
-        default: ''
-      data_force:
-        description: 'data job 跳过收盘结算闸门（仅排错用，会按当前 ET 日期抓行情）'
+        description: '只算不推'
         type: choice
         options: ['false', 'true']
         default: 'false'
-
-# 顶层只读；需要回写 data 分支的 job 自己声明 contents: write。
-# 代码仓库的 checkout 一律 persist-credentials: false，只有 data 的那份留着 token 用于 push。
-# 第三方 action 锁 commit SHA（注释里是对应的大版本），避免上游 tag 被改写。
-permissions:
-  contents: read
+  schedule:
+    - cron: '30 21 * * 1-5'
 
 concurrency:
   group: paper-trade
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 env:
-  PYTHONPATH: src
-  TA_DATA_ROOT: ${{ github.workspace }}/data
-  TA_STATE_DIR: ${{ github.workspace }}/data/state/live
-  TA_RUN_ID: ${{ github.run_id }}
   TZ: Asia/Shanghai
-  # 三个数据源密钥提到顶层：原来只挂在 data job 的某一步上，
-  # 导致 signal job 里 config 读到空值，降级链和日历校验都只有 yahoo/内置规则
-  ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-  ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-  TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
 
 jobs:
-  test:
-    # 独立 job：测试红了会标红提醒，但不拦着 signal / data 干活（月末信号不能被一个测试挡住）
-    name: 单元测试
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: 取代码
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: 安装依赖
-        run: pip install -q -r requirements-ci.txt
-      - name: pytest
-        run: python -m pytest tests -q
-
   signal:
-    name: 盘中信号与推送
+    name: 信号与推送
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: write          # 要回写 live/state/（持仓、补选、幂等键）
     steps:
       - name: 取代码
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-        with:
-          persist-credentials: false
-      - name: 取数据分支
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-        with:
-          ref: data
-          path: data
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
+
       - name: 安装依赖
-        run: pip install -q -r requirements-ci.txt
+        run: pip install -q "pandas>=2.0" "numpy>=1.24" "pyarrow>=14.0"
+
+      - name: 判定今天要不要跑
+        id: gate
+        run: |
+          set +e
+          python live/signal.py --check ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "10" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
       - name: 算信号并推送
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run != 'true'
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        # tee 一份到文件：artifact 是排错兜底，真正的回溯靠 data 分支的 state/live
         run: |
-          python -m scripts.live_signal \
-            --kind "${{ github.event.inputs.kind || 'auto' }}" \
-            ${{ github.event.inputs.now != '' && format('--now "{0}"', github.event.inputs.now) || '' }} \
-            ${{ github.event.inputs.force == 'true' && '--force' || '' }} \
-            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} \
-            2>&1 | tee "$RUNNER_TEMP/live_signal.log"
-      - name: 上传运行日志（兜底，14 天）
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
-        with:
-          name: live-signal-${{ github.run_id }}
-          path: ${{ runner.temp }}/live_signal.log
-          retention-days: 14
-          if-no-files-found: ignore
-      - name: 回写日志与账本到 data 分支
-        id: writeback
-        # always：算信号失败时也要把 runs/ 里的 error 行提交上去，否则失败永远查不到
-        if: always() && github.event.inputs.dry_run != 'true'
+          python live/signal.py --push \
+            ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+
+      - name: 试算（不推送）
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run == 'true'
         run: |
-          cd data
-          git checkout -B data
+          python live/signal.py --json \
+            ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+
+      - name: 回写 live/state/
+        # 复盘（date）与试算（dry_run）都不该动账本
+        if: steps.gate.outputs.skip == 'false' && github.event.inputs.dry_run != 'true' && github.event.inputs.date == ''
+        run: |
           git config user.name  "paper-trade-bot"
           git config user.email "paper-trade-bot@users.noreply.github.com"
-          git add -A
+          mkdir -p live/state            # 首次运行目录还不存在，git add 会报 pathspec
+          git add -A live/state
           if git diff --cached --quiet; then
-            echo "无变更"
+            echo "账本无变更，跳过提交"
             exit 0
           fi
           git commit -m "state: $(date -u +%F' '%H:%MZ) run ${{ github.run_id }}"
           for i in 1 2 3; do
-            if git push origin data; then
-              echo "已提交 run ${{ github.run_id }}"
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "账本已回写"
               exit 0
             fi
             echo "push 失败（第 $i 次），rebase 后重试"
-            git pull --rebase --autostash origin data || true
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
             sleep $((i * 3))
           done
-          echo "::error::日志未能提交到 data 分支（run ${{ github.run_id }}）"
+          echo "::error::live/state 回写失败"
           exit 1
-      - name: 回写失败告警（一等告警）
-        # 回写三次全失败 = 幂等键和账本没落盘，下一次触发可能重复推送、持仓回退。
-        # 不能只靠 job 标红：直接推一条到手机。
-        if: always() && steps.writeback.outcome == 'failure'
-        env:
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: |
-          python - <<'PY'
-          import os
-          from quant.live import notify
-          notify.send("[模拟盘·异常] data 分支回写失败",
-                      "run ${{ github.run_id }}\n\n本次信号/账本**未写入 data 分支**，"
-                      "幂等键与持仓可能回退，下一次触发可能重复推送。请手动检查 data 分支并补写。")
-          PY
 
   data:
-    name: 收盘后数据更新
+    name: 盘后数据更新
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: write
     steps:
       - name: 取代码
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-        with:
-          persist-credentials: false
-      - name: 取数据分支
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-        with:
-          ref: data
-          path: data
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: 安装依赖
-        # 与 signal job 同一份锁定文件，两边环境一致
-        run: pip install -q -r requirements-ci.txt
-      - name: 更新行情与换手率
-        env:
-          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
-          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-          TIINGO_TOKEN: ${{ secrets.TIINGO_TOKEN }}
-        # data_now / data_force 都只给排错用：默认空/false，定时任务行为不变。
-        # --now 是 UTC 语义（与 live_signal 的 --now 按 ET 不同），给 21:10 就能过闸门并锁住交易日。
-        run: |
-          python -m scripts.paper_close_update \
-            ${{ github.event.inputs.data_now != '' && format('--now "{0}"', github.event.inputs.data_now) || '' }} \
-            ${{ github.event.inputs.data_force == 'true' && '--force' || '' }}
 
-      - name: 生成数据说明（MANIFEST.md）
-        # 每次更新数据后原地重写 MANIFEST.md，跟着数据一起提交到 data 分支
-        # always：行情更新失败时也要重写，保证 MANIFEST 描述的是盘上真实内容
-        if: always()
-        run: python -m scripts.data_manifest
-      - name: 回写 data 分支
-        # always：收盘更新失败时也要把已有数据和失败痕迹提交上去，
-        # 否则失败只留在 90 天后消失的 run log 里，事后查不到
-        if: always()
+      - name: 安装依赖
+        run: pip install -q "pandas>=2.0" "numpy>=1.24" "pyarrow>=14.0" "requests>=2.31"
+
+      - name: 判定是否已收盘
+        id: gate
         run: |
-          cd data
-          git checkout -B data
+          set +e
+          python live/gate.py data
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "10" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: 更新 upload/ 三张表
+        if: steps.gate.outputs.skip == 'false'
+        run: python upload/update_all.py
+
+      - name: 回写 upload/
+        if: steps.gate.outputs.skip == 'false'
+        run: |
           git config user.name  "paper-trade-bot"
           git config user.email "paper-trade-bot@users.noreply.github.com"
-          git add -A
+          git add upload/
           if git diff --cached --quiet; then
-            echo "无变更"
+            echo "无变更，跳过提交"
             exit 0
           fi
           git commit -m "data: $(date -u +%F' '%H:%MZ) run ${{ github.run_id }}"
           for i in 1 2 3; do
-            if git push origin data; then
-              echo "已提交 run ${{ github.run_id }}"
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "已回写 ${{ github.ref_name }}"
               exit 0
             fi
             echo "push 失败（第 $i 次），rebase 后重试"
-            git pull --rebase --autostash origin data || true
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
             sleep $((i * 3))
           done
-          echo "::error::数据未能提交到 data 分支（run ${{ github.run_id }}）"
+          echo "::error::upload/ 回写失败"
           exit 1
 
   next-trigger:
-    # 闭环：每次运行后算出下一次触发时刻，写回 Cloudflare Worker 的 Cron。
-    # 失败会推 pushplus；兜底是每日自检（cron_check.yml）。见 scripts/cron_sync.py。
-    name: 更新下一次触发时刻
+    # 闭环：每次跑完算出下一次 signal / data 的精确 UTC 时刻，
+    # 写成一次性日期 cron 推给 Cloudflare。缺了这个 job，Cloudflare 的 cron
+    # 会停在最后一次的值，夏令时切换后整体偏一小时。
+    name: 更新下次触发时刻
     needs: [signal, data]
     if: always() && github.event.inputs.dry_run != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: 取代码
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: 安装依赖
-        run: pip install -q -r requirements-ci.txt
+
       - name: 同步 Cloudflare Cron
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python -m scripts.cron_sync sync
+        run: python live/cron_sync.py sync
