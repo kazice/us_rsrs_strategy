@@ -45,6 +45,7 @@ def _load_local(mod_name: str, path: Path):
 cal = _load_local("market_calendar", HERE / "market_calendar.py")
 books = _load_local("live_books", HERE / "books.py")
 quote = _load_local("live_quote", HERE / "quote.py")
+live_bar = _load_local("live_bar", HERE / "live_bar.py")
 
 SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLC"]
 BENCH = "SPY"
@@ -278,6 +279,8 @@ def _render_push(out: dict) -> tuple[str, str]:
         for c in out["candidates"]:
             flag = "通过" if c["pass"] else "淘汰(" + ",".join(c["fail_on"]) + ")"
             lines.append(f"- {c['symbol']}（{c['sector']}）{flag}")
+    if out.get("notes"):
+        lines += ["", "**口径**"] + [f"- {n}" for n in out["notes"]]
     return title[:100], "\n".join(lines)
 
 
@@ -467,16 +470,32 @@ def main() -> int:
         return _run_stop(pos, a, data_dir, ktab)
 
     bars, etf, mem = load(data_dir)
-    all_dates = sorted(bars.date.unique())
-    day = pd.Timestamp(a.date) if a.date else pd.Timestamp(all_dates[-1])
-    if day not in bars.date.values:
-        near = [d for d in all_dates if d <= day]
-        if not near:
-            print(f"日期 {day.date()} 早于数据起点")
-            return 1
-        day = pd.Timestamp(near[-1])
+    notes: list[str] = []
+    day = None
+
+    # 实盘：用 15:30 的实时报价补一根当日 bar（表里最新一行还是昨天）
+    if not a.replay:
+        snap = live_bar.build(bars, etf, mem, ktab, today)
+        if snap is not None:
+            bars, etf, mem, live_day, notes = snap
+            day = pd.Timestamp(live_day)
+            print(f"口径：实时合成 {live_day} 当日 bar"
+                  f"（{len(bars)} 只个股 / {len(etf)} 个 ETF）")
+        else:
+            print("未合成当日 bar（非交易日 / 日线已入库 / 报价不足），退回数据最新日")
+
+    if day is None:
+        all_dates = sorted(bars.date.unique())
+        day = pd.Timestamp(a.date) if a.date else pd.Timestamp(all_dates[-1])
+        if day not in bars.date.values:
+            near = [d for d in all_dates if d <= day]
+            if not near:
+                print(f"日期 {day.date()} 早于数据起点")
+                return 1
+            day = pd.Timestamp(near[-1])
 
     out = compute_signal(bars, etf, mem, day)
+    out["notes"] = notes
     if a.hold:
         out["action"] = f"（指定持仓 {a.hold.upper()}）" + out["action"]
 
