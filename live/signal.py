@@ -19,6 +19,7 @@ import argparse
 import datetime as dt
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -373,6 +374,69 @@ def _today(a) -> dt.date:
     return dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(cal.ET).date()
 
 
+def _notify(title: str, body: str) -> bool:
+    notify = _load_local("live_notify", HERE / "notify.py")
+    return notify.send(title, body)
+
+
+_FRESH_ALERTED = False          # 一次进程只告警一次，止损检查和信号会各自加载数据
+
+
+def _refresh_upload() -> bool:
+    """调 upload/update_all.py 把三张表补齐（只在数据目录就是 upload 时有意义）。"""
+    script = ROOT / "upload" / "update_all.py"
+    if not script.exists():
+        print("::warning::找不到 upload/update_all.py，无法自动补数据")
+        return False
+    print("自动补数据：python upload/update_all.py")
+    try:
+        r = subprocess.run([sys.executable, str(script)], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=1500)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"::warning::补数据执行失败：{type(exc).__name__}: {exc}")
+        return False
+    for line in ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-10:]:
+        print("  " + line)
+    if r.returncode != 0:
+        print(f"::warning::update_all 退出码 {r.returncode}")
+        return False
+    return True
+
+
+def _ensure_fresh(a, data_dir: Path, bars, etf, mem):
+    """数据必须至少到「上一个交易日」。落后就先自己补一次，还不行就告警并停手。
+
+    为什么不能凑合：`live_bar` 会用实时价补出今天的 bar，但 MA/ADX/RSRS 都建立在
+    历史序列上。少了昨天那一行，指标全错，却照样能算出一个信号去买——比不跑更危险。
+    """
+    global _FRESH_ALERTED
+    want = cal.prev_trading_day(_today(a))
+    newest = pd.Timestamp(bars.date.max()).date()
+    if newest >= want:
+        return True, bars, etf, mem
+
+    print(f"::warning::数据最新 {newest}，落后于上一交易日 {want}，先自动补一次")
+    is_upload = data_dir.resolve() == (ROOT / "upload").resolve()
+    if is_upload:
+        _refresh_upload()
+        bars, etf, mem = load(data_dir)
+        newest = pd.Timestamp(bars.date.max()).date()
+        if newest >= want:
+            print(f"数据已补齐到 {newest}，继续出信号")
+            return True, bars, etf, mem
+    else:
+        print(f"::warning::数据目录是 {data_dir.name}，不自动更新（只补 upload/）")
+
+    msg = (f"数据最新停在 **{newest}**，落后于上一个交易日 **{want}**。\n\n"
+           f"今天不出信号，避免用旧数据下单。\n"
+           f"请检查 `upload/update_all.py` 的日志（可能是数据源限流或接口变更）。")
+    print(f"::error::数据陈旧，今天跳过：{newest} < {want}")
+    if not _FRESH_ALERTED:
+        _notify("[实盘·异常] 数据更新失败，今天未出信号", msg)
+        _FRESH_ALERTED = True
+    return False, bars, etf, mem
+
+
 def _prepare(a, data_dir: Path, ktab):
     """备好当日行情：优先用 15:30 实时报价合成当日 bar，否则退回数据最新日。
 
@@ -382,6 +446,9 @@ def _prepare(a, data_dir: Path, ktab):
     notes: list[str] = []
     day = None
     if not a.replay:
+        ok, bars, etf, mem = _ensure_fresh(a, data_dir, bars, etf, mem)
+        if not ok:
+            return None
         snap = live_bar.build(bars, etf, mem, ktab, _today(a))
         if snap is not None:
             bars, etf, mem, live_day, notes = snap
