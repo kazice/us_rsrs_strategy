@@ -103,14 +103,21 @@ def occasion_kind(d: dt.date) -> str:
 
 
 def resolve_kind(d: dt.date, pos, refill: dict) -> str:
-    """结合账本的最终动作：持仓每天查止损，补选窗口内逐日重挑。"""
+    """结合账本的最终动作。
+
+    调仓日 / 周报日优先：这两件事必须照日历发生，否则持仓期间永远不会换标的。
+    止损检查不在这里返回——main 里在调仓/周报之前先跑一次（见 _stop_first）。
+    """
     if not cal.is_trading_day(d):
         return "none"
+    occ = occasion_kind(d)
+    if occ in ("rebalance", "week"):
+        return occ
     if not pos.is_empty():
         return "stop"
     if refill.get("open") and str(refill.get("since", "")) <= str(d) <= str(refill.get("until", "")):
         return "refill"
-    return occasion_kind(d)
+    return occ
 
 
 def next_month_end(d: dt.date) -> dt.date:
@@ -479,6 +486,14 @@ def main() -> int:
 
     if kind == "stop":
         return _run_stop(pos, a, data_dir, ktab)
+
+    # 调仓日 / 周报日如果还持有股票，先做一次止损检查（与回测「先查止损再调仓」同序）；
+    # 被割掉就清了仓，下面的调仓照常进行。
+    if not a.replay and not pos.is_empty() and pos.kind == "stock":
+        rc = _run_stop(pos, a, data_dir, ktab)
+        if rc:
+            return rc
+        pos = books.load_position()
 
     bars, etf, mem = load(data_dir)
     notes: list[str] = []
