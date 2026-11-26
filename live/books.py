@@ -48,7 +48,7 @@ class Position:
     entry_adj: float = 0.0     # 建仓日复权收盘（bars.close 本身就是总收益复权）
     entry_k: float = 1.0       # 建仓日 k（未复权 × k = 复权），拆股后要用它折算
     nav: float = 1.0
-    stop_retry: int = 0        # 本自然月是否已用过止损重选（回测 --stop-repick-dom）
+    stop_retry: int = 0        # 历史字段，保留兼容；止损后重选已不再限制次数
 
     def is_empty(self) -> bool:
         return not self.symbol

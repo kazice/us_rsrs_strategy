@@ -4,8 +4,8 @@
 
     rebalance  月末最后交易日：选标的、记账、推送
     week       周内最后交易日：只出周报，不动持仓
-    stop       每个交易日收盘前：持仓票跌破 -10% 割掉，本月 11 号前可重选
-    refill     空仓 / 止损后：逐日重挑，直到下一个调仓日
+    stop       每个交易日收盘前：持仓票跌破 -10% 割掉，本月 15 号前可重选
+    refill     空仓 / 止损后：逐日重挑（先判牛熊：熊市买板块 ETF，牛市买个股）
 
 用法：
 
@@ -58,7 +58,7 @@ TOPN_STOCK = 3
 BEAR_TOPN = 3
 BEAR_RATIO = 0.5
 STOP_LOSS = 0.10
-STOP_REPICK_DOM = 11        # 止损后允许重选的截止日（自然月）
+STOP_REPICK_DOM = 15        # 止损后是否给补选机会的截止日（自然月），与回测 REFILL_DAY 一致
 
 GATE_NAMES = [
     ("MA20>MA60", lambda r: r.ma20 > r.ma60),
@@ -370,15 +370,17 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
         return 0
     sold = pos.symbol                     # record_stop 会清掉 pos.symbol，先留住
     action = f"止损卖出 {sold}（{ret_s}）"
-    allow = today.day < STOP_REPICK_DOM and int(pos.stop_retry) == 0
-    print(f"{action}｜{'本月可重选' if allow else '本月不再重选'}")
+    # 只有 15 号之前止损才给补选机会；15 号及以后直接空仓到下一个调仓日
+    allow = today.day < STOP_REPICK_DOM
+    print(f"{action}｜{'次一交易日起逐日重判牛熊' if allow else '本月不再补选，空仓到调仓日'}")
 
     if a.replay:
         return 0
 
     books.record_stop(pos, day=str(today), action=action, price=q, ret=ret,
-                      note="止损", retry_used=1 if allow else pos.stop_retry)
+                      note="止损", retry_used=pos.stop_retry)
     if allow:
+        # origin=stop 的窗口在 _run_refill 里用当天的 bear_ratio21，每天重判
         books.set_refill(since=str(today), until=str(next_month_end(today)),
                          bull=True, exclude=sold, origin="stop")
 
@@ -386,7 +388,8 @@ def _run_stop(pos, a, data_dir: Path, ktab) -> int:
            "spy_bear_ratio21": None, "sector_rank": [], "candidates": [],
            "action": action,
            "position_line": f"**已清仓**：{sold}｜持有期 {ret_s}｜卖出价 {q:.2f}"}
-    tail = f"补选：{'次一交易日起逐日重挑（排除 ' + sold + '）' if allow else '本月不再重选'}"
+    tail = (f"补选：次一交易日起逐日重判牛熊（先排除 {sold}）" if allow
+            else "本月不再补选，空仓到下一个调仓日")
     books.mark_pushed("stop", str(today), {"action": action[:60]})
     if a.push and not _push(out, [tail]):
         return 2
@@ -399,7 +402,15 @@ def _run_refill(out: dict, pos, refill: dict, a, bars, etf, ktab) -> int:
     out["kind"] = "refill"
     exclude = str(refill.get("exclude") or "").upper()
 
-    if not out["is_bear"] and bool(refill.get("bull", True)):
+    # 窗口来源不同，牛熊怎么判也不同，必须跟回测一致：
+    #   origin=stop      止损后待命 -> 用**当天**的 bear_ratio21，每天重判
+    #   origin=rebalance 牛市选不出票 -> 沿用开窗那天冻结的 bull，期间不改判
+    if str(refill.get("origin")) == "stop":
+        bull_now = not bool(out["is_bear"])
+    else:
+        bull_now = bool(refill.get("bull", True))
+
+    if bull_now:
         cands = [c for c in out["candidates"] if c["pass"] and c["symbol"].upper() != exclude]
         pick = cands[0] if cands else None
         if pick:

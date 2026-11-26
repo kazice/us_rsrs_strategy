@@ -1,0 +1,27 @@
+{
+  "tag": "baseline",
+  "generated": "2026-11-27 01:43:53",
+  "data_dir": "latest_data",
+  "start": "2022-01-03",
+  "end": "2026-11-13",
+  "cost": 0.0005,
+  "strategy": {
+    "ADX_MIN": 10.0,
+    "MCAP_MIN": 50000000000.0,
+    "TURN_CAP": 0.2,
+    "TOPN_SECTOR": 3,
+    "TOPN_STOCK": 3,
+    "STOP_LOSS": 0.1,
+    "REFILL_DAY": 15,
+    "BEAR_TOPN": 3,
+    "BEAR_RATIO": 0.5,
+    "DEFAULT_START": "2021-12-31"
+  },
+  "summary": {
+    "trades": 53,
+    "stops": 4,
+    "win": 0.6792,
+    "avg_ret": 0.058458,
+    "cash_ratio": 0.1448
+  }
+}

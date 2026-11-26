@@ -39,7 +39,7 @@ TURN_CAP = 0.20
 TOPN_SECTOR = 3
 TOPN_STOCK = 3
 STOP_LOSS = 0.10
-REFILL_DAY = 11
+REFILL_DAY = 15
 BEAR_TOPN = 3
 BEAR_RATIO = 0.5      # 过去 21 日中跌破 MA200 的比例阈值
 
@@ -77,8 +77,6 @@ class Cfg:
     end: str | None = None
     cost: float = 0.0005
     data_dir: str | Path = DEFAULT_DATA
-    # 变体开关：止损当天重新判定 regime（默认关闭，保持基线口径）
-    bear_on_stop: bool = False
 
 
 def load_data(data_dir):
@@ -255,17 +253,43 @@ def run(cfg: Cfg, dump: bool = False):
                            buy_dt=dt, sector=sec, name=name)
 
         # ---------- 持有期（含牛市空仓补选、止损、止损补买）
+        after_stop = False      # 止损后待命：只有这种空仓才逐日重判牛熊
+        halted = False          # 15 号及以后止损：本月不再补选，空仓到下一调仓日
         for d in hold_days:
-            # 牛市空仓 -> 逐日补选（熊市不补选，空仓到下一调仓日）
-            if cur is None and not is_bear:
-                c2 = eng.stock_candidates(d)
-                got2 = eng.pick_stock(c2, d)
-                if got2:
-                    sec2, q, qpx = got2
-                    if pd.notna(qpx) and qpx > 0:
-                        capital *= 1 - cfg.cost
-                        cur = dict(key=q, kind="stock", shares=capital / qpx, buy_px=qpx,
-                                   buy_dt=d, sector=sec2, name=eng.sym.get(q, ""))
+            bear_now = eng.bear(d)
+
+            if cur is None:
+                if after_stop:
+                    # 止损后每个交易日继续判牛熊：熊市找板块 ETF（选不出就继续空仓），
+                    # 牛市才回到个股。
+                    if bear_now:
+                        got_e = eng.pick_bear_etf(d)
+                        if got_e:
+                            sym_e, px_e = got_e
+                            capital *= 1 - cfg.cost
+                            cur = dict(key=sym_e, kind="etf", shares=capital / px_e, buy_px=px_e,
+                                       buy_dt=d, sector=sym_e, name=sym_e)
+                    else:
+                        c2 = eng.stock_candidates(d)
+                        got2 = eng.pick_stock(c2, d)
+                        if got2:
+                            sec2, q, qpx = got2
+                            if pd.notna(qpx) and qpx > 0:
+                                capital *= 1 - cfg.cost
+                                cur = dict(key=q, kind="stock", shares=capital / qpx, buy_px=qpx,
+                                           buy_dt=d, sector=sec2, name=eng.sym.get(q, ""))
+                    if cur is not None:
+                        after_stop = False
+                elif not is_bear and not halted:
+                    # 牛市空仓 -> 逐日补选（原逻辑，未改动）
+                    c2 = eng.stock_candidates(d)
+                    got2 = eng.pick_stock(c2, d)
+                    if got2:
+                        sec2, q, qpx = got2
+                        if pd.notna(qpx) and qpx > 0:
+                            capital *= 1 - cfg.cost
+                            cur = dict(key=q, kind="stock", shares=capital / qpx, buy_px=qpx,
+                                       buy_dt=d, sector=sec2, name=eng.sym.get(q, ""))
 
             if cur is None:
                 nav_rows.append(dict(date=d, nav=capital, hold="cash"))
@@ -286,33 +310,33 @@ def run(cfg: Cfg, dump: bool = False):
                 nav_rows.append(dict(date=d, nav=capital, hold="cash"))
                 lost = cur["key"]
                 cur = None
-                # 11 号前补买一次（不同票）
+                # 11 号前补买一次（不同票），同样先判牛熊再决定买什么
                 if d.day < REFILL_DAY:
-                    # 变体：此时离调仓日已过几个交易日，重新用当天 SPY 的
-                    # bear_ratio21 判定 regime。是熊市就买板块 ETF（选不出就空仓），
-                    # 不再往个股里扎。默认关闭，基线口径仍是调仓日的旗标。
-                    if cfg.bear_on_stop and eng.bear(d):
-                        # 一旦判定为熊市，本周期余下时间都按熊市处理：
-                        # 否则第二天「空仓逐日补选」会把个股又买回来。
-                        is_bear = True
+                    if bear_now:
                         got_e = eng.pick_bear_etf(d)
                         if got_e:
                             sym_e, px_e = got_e
                             capital *= 1 - cfg.cost
                             cur = dict(key=sym_e, kind="etf", shares=capital / px_e,
                                        buy_px=px_e, buy_dt=d, sector=sym_e, name=sym_e)
-                        continue
-                    # 必须用当天 d 的候选与报价：用 cands/dt 会把调仓日的收盘价
-                    # 当成当天的买入价，Buy 记录的日期与价格对不上（差出好几天）。
-                    c3 = eng.stock_candidates(d)
-                    got3 = eng.pick_stock(c3, d, exclude=lost)
-                    if got3:
-                        sec3, q3, qpx3 = got3
-                        if pd.notna(qpx3) and qpx3 > 0:
-                            capital *= 1 - cfg.cost
-                            cur = dict(key=q3, kind="stock", shares=capital / qpx3, buy_px=qpx3,
-                                       buy_dt=d, sector=sec3, name=eng.sym.get(q3, ""))
-                            continue
+                    else:
+                        # 必须用当天 d 的候选与报价：用 cands/dt 会把调仓日的收盘价
+                        # 当成当天的买入价，Buy 记录的日期与价格对不上（差出好几天）。
+                        c3 = eng.stock_candidates(d)
+                        got3 = eng.pick_stock(c3, d, exclude=lost)
+                        if got3:
+                            sec3, q3, qpx3 = got3
+                            if pd.notna(qpx3) and qpx3 > 0:
+                                capital *= 1 - cfg.cost
+                                cur = dict(key=q3, kind="stock", shares=capital / qpx3,
+                                           buy_px=qpx3, buy_dt=d, sector=sec3,
+                                           name=eng.sym.get(q3, ""))
+                                continue
+                    # 当天没买进 -> 进入「止损后待命」，后面每个交易日按牛熊重新决策
+                    after_stop = cur is None
+                else:
+                    # 15 号及以后止损：本月不再补选，空仓到下一个调仓日
+                    halted = True
                 continue
 
             nav_rows.append(dict(date=d, nav=cur["shares"] * pr, hold=cur["name"]))
@@ -345,14 +369,11 @@ def main() -> int:
                     help="baseline = 正式基线（落 reports/baseline）；其它名字 = 参数试验，"
                          "按时间戳落 logs/<时间戳>_<tag>/")
     ap.add_argument("--dump-candidates", action="store_true")
-    ap.add_argument("--bear-on-stop", action="store_true",
-                    help="变体：止损当天用 SPY 重新判定熊市，是熊市就买板块 ETF（不买个股）")
     a = ap.parse_args()
 
     data_dir = Path(a.data_dir)
 
-    nav, trades, cands = run(Cfg(a.start, a.end, a.cost, data_dir, a.bear_on_stop),
-                             a.dump_candidates)
+    nav, trades, cands = run(Cfg(a.start, a.end, a.cost, data_dir), a.dump_candidates)
     if not len(nav):
         print("no nav")
         return 1
@@ -383,7 +404,6 @@ def main() -> int:
         "start": str(nav.index.min().date()),
         "end": str(nav.index.max().date()),
         "cost": a.cost,
-        "variants": {"bear_on_stop": bool(a.bear_on_stop)},
         "strategy": {k: globals().get(k) for k in PARAM_KEYS},
         "summary": {
             "trades": int(len(trades)),

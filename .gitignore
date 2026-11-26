@@ -1,7 +1,11 @@
 # 运行产物
 logs/
-reports/
 backtest/output/
+
+# 基线结果入库：reports/baseline 的数据 + reports/index.html 看板
+reports/*
+!reports/baseline/
+!reports/index.html
 
 # 实盘账本必须入库（持仓/补选/幂等键），不要在这里忽略
 !live/state/
